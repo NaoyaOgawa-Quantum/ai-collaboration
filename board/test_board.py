@@ -423,6 +423,8 @@ class Note(unittest.TestCase):
     def test_review_request_needs_a_referee_copy_or_not_blind(self):
         # A deny list in the spec did not stop a header comment of the target that recorded the previous round's
         # verdict (measured): a request that reads like a review names a comment-free copy, or says --not-blind.
+        if not board.REVIEW_TARGET_CHECK.is_file():
+            self.skipTest(f'companion {board.REVIEW_TARGET_CHECK.name} is not next to this engine (a copy outside the repository; run in a worktree)')
         import argparse
         with tempfile.TemporaryDirectory() as td:
             raw=Path(td)/'note.tex'; raw.write_text('% Blind review: verdict incorrect; see plans/x-results.md\n\\section{A}\n')
@@ -950,6 +952,8 @@ class CollaboratorBoards(unittest.TestCase):
         self.assertNotEqual(p.returncode,0); self.assertIn('the open blocker is '+b2,p.stderr)
         self.assertNotIn('event_id=',p.stdout)                      # refused before an id is printed for retry
     def test_review_target_flags_reach_the_cli(self):
+        if not board.REVIEW_TARGET_CHECK.is_file():
+            self.skipTest(f'companion {board.REVIEW_TARGET_CHECK.name} is not next to this engine (a copy outside the repository; run in a worktree)')
         b=str(self.proj/'board')
         (self.proj/'notes/raw.tex').write_text('% previous round: verdict incorrect, see plans/r.md\n\\section{A}\n')
         (self.proj/'notes/referee.tex').write_text('\\section{A}\ntext\n')
