@@ -123,6 +123,14 @@ in-progress edits. This is durable delivery on the next check, not unattended di
 separate program with its own execution policy. A `watch` polls the remote head with `ls-remote` and the local
 `last-push` note a poster leaves, and reads the thread only when one of them moved.
 
+**Starting the worker a role names**: the board still starts no agent by itself. A request to a role prints the
+command that opens the worker as a background CLI session with model, effort and config dir pinned, and runs it only
+on `--launch` — the requester's shell is the actor. Measured before: the desktop's chip opened on the parent's model,
+the model switch is app-wide, and a hand-off pasted into a window ran on whatever model that window had; the
+hand-off text is therefore passed by file (quoting-free) and names the model too, for windows opened by hand. The
+defaults (account, model, effort) are environment variables set by the owner's wiring, so no personal path lives
+here.
+
 ## <a id="path-touches"></a>Path touches
 
 Closing sweeps running in several sessions wrote the same shared files, and a v2 claim reserves a task, not files

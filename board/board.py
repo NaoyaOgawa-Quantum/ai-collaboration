@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,10 @@ view=importlib.util.module_from_spec(spec); spec.loader.exec_module(view)
 GIT_TIMEOUT=int(os.environ.get('AGENT_BOARD_GIT_TIMEOUT','120'))  # seconds per git call (clone/push of the temporary checkout)
 NOTIFY_POLL_S=2     # watch: how often the local last-push note is looked at between remote checks
 DEFAULT_REVIEWER_ENV='AGENT_BOARD_DEFAULT_REVIEWER'   # request: reviewer session id when --reviewer is absent; <project> expands
+LAUNCH_CONFIG_DIR_ENV='AGENT_BOARD_LAUNCH_CONFIG_DIR'  # request to a role: the CLI config dir the worker runs under (a logged-in account); owner wiring
+LAUNCH_MODEL_ENV='AGENT_BOARD_LAUNCH_MODEL'            # request to a role: default --model (else --expect-model, else the requester's own model)
+LAUNCH_EFFORT_ENV='AGENT_BOARD_LAUNCH_EFFORT'          # request to a role: default --effort (else the requester's CLAUDE_EFFORT)
+LAUNCH_CLI_ENV='AGENT_BOARD_LAUNCH_CLI'                # the CLI executable (default `claude`; tests point it at a stub)
 
 
 def run(root, *args, check=True):
@@ -673,6 +678,53 @@ def event_from(a, events):
     return ev
 
 
+def handoff_text(root, role, request_id, spec, model, effort):
+    """What a worker window starts from (CONTRACT.md#worker-handoff-text): role, request, spec, the model and effort it
+    must run on, and the first two steps. Written to a file and passed to the CLI whole, so quoting never bites."""
+    run=(f" This window must run on {model}"+(f" at {effort} effort" if effort else '')+'.') if model else ''
+    eng=Path(__file__).resolve()
+    return (f"You are the board worker for role `{role}`, request `{request_id}`, spec `{spec or '(the request itself)'}`; execute it yourself.{run}\n"
+            f"1. `python3 {eng} inbox --root {root} --agent claude --session {role} --sync`; if the request is not visible, do not read the spec — ask the requester or `watch`.\n"
+            f"2. `claim` with `--session-name '<your native session id, 8 chars> ({model or '<model>'})'`; if refused with *another live claim exists*, stop and say so in one line.\n"
+            f"3. Do the work the spec asks for; when done, `submit` with the deliverable paths.\n")
+
+
+def own_model(session):
+    """The requester's own model (its transcript), or '' (companion absent, headless, another machine)."""
+    try: return _session_model().model_of(session) or ''
+    except Exception: return ''
+
+
+def launch_plan(root, role, request_id, spec, expect, session):
+    """The command that starts the addressed worker as a background CLI session with model, effort and config dir pinned.
+
+    Returns (argv, env, shell line, hand-off file). Model = --expect-model, else the owner's default, else the
+    requester's own model (the chip's old default); effort = the owner's default, else the requester's; config dir =
+    the owner's default (a logged-in account: measured, the default dir of one machine was not logged in and the
+    banner showed usage billing). The board does not start the worker itself unless --launch is given: the
+    requester's shell does, with the hand-off text read from the file."""
+    model=(expect or os.environ.get(LAUNCH_MODEL_ENV) or own_model(session) or '').strip()
+    effort=(os.environ.get(LAUNCH_EFFORT_ENV) or os.environ.get('CLAUDE_EFFORT') or '').strip()
+    cfg=os.path.expanduser((os.environ.get(LAUNCH_CONFIG_DIR_ENV) or '').strip())
+    text=handoff_text(root,role,request_id,spec,model,effort)
+    path=outbox_dir(root)/(request_id+'.handoff.txt'); path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    path.write_text(text,encoding='utf-8'); path.chmod(0o600)
+    cli=os.environ.get(LAUNCH_CLI_ENV) or 'claude'
+    argv=[cli,'--bg']+(['--model',model] if model else [])+(['--effort',effort] if effort else [])+[text]
+    env=dict(os.environ); env.pop('CLAUDECODE',None)
+    if cfg: env['CLAUDE_CONFIG_DIR']=cfg
+    line=((f'CLAUDE_CONFIG_DIR={shlex.quote(cfg)} ' if cfg else '')+shlex.quote(cli)+' --bg'+(f' --model {shlex.quote(model)}' if model else '')
+          +(f' --effort {shlex.quote(effort)}' if effort else '')+f' "$(cat {shlex.quote(str(path))})"')
+    return argv,env,line,path
+
+
+def launch(argv, env):
+    """Start the worker now; returns the CLI's output (the background session id and the attach/logs/stop lines)."""
+    p=subprocess.run(argv,env=env,capture_output=True,text=True,timeout=120)
+    if p.returncode: raise ValueError('launch failed: '+(p.stderr or p.stdout)[-800:])
+    return (p.stdout or '').strip()
+
+
 def reviewer_for(a, cfg):
     """The reviewer session id of a request: --reviewer, else the environment default (owner boards, ordinary
     posts; `<project>` expands to the project key), else None (the requester stays the reviewer)."""
@@ -819,6 +871,7 @@ def main():
     ap.add_argument('--json',action='store_true',help='inbox: waiting rows; show: one request object; boards: the list; warnings go to stderr')
     ap.add_argument('--include-closed',action='store_true',help='inbox: also show completed requests involving this exact session (not actionable)')
     ap.add_argument('--interval',type=float,default=30,help='watch: seconds between remote checks (default transport: one ls-remote round trip, a read only when the branch moved; clone transport: a full read)')
+    ap.add_argument('--launch',action='store_true',help='request to a role: start the worker now with the printed CLI command (background session; the id is printed)')
     ap.add_argument('--reviewer',help='request: the session that receives the submission (default: the requester; env '
                     f'{DEFAULT_REVIEWER_ENV} with <project> on an owner board). A role id outlives this session; posted as a reviewer handover right after the request')
     ap.add_argument('--max-minutes',type=float,default=240,help='watch: give up after this long (exit 3)')
@@ -1081,6 +1134,14 @@ def main():
             probs=errors(hev,json.loads(SCHEMA_PATH.read_text()))+[x for x in reduce_workflow(same+[ev,hev],view.now_utc())['errors'] if x.startswith(hev['event_id']+':')]
             if probs: raise ValueError('reviewer handover: '+'; '.join(probs))
             print('posted '+post(a.root,hev)+f' (検収役 = {a.agent}/{reviewer}: 提出は inbox --session {reviewer} に載る。 受領は --session {reviewer} --session-name \'<native id 8 chars> (<model>)\' で accept / revise)')
+        if a.to=='claude' and (a.to_session or '').startswith('role-'):
+            # A role names a window nobody has opened: print the command that opens it with model, effort and account
+            # pinned (measured: the chip opens on the parent's model, and a pasted hand-off ran on whatever the window had).
+            argv,env,line,hpath=launch_plan(a.root,a.to_session,ev['event_id'],(a.reference or [None])[0],a.expect_model,a.session)
+            print(f'→ 受け手を起こす (model・effort・account を固定、 貼り付け不要。 依頼元の shell でそのまま):\n  {line}')
+            print(f'  (hand-off 文 = {hpath}。 desktop の窓で steer したいときだけ chip、 その文面もこの file)')
+            if a.launch:
+                print('→ 起動した: '+launch(argv,env).replace('\n','\n  '))
     if rid and a.command in {'request','claim','submit','blocker','revise','update'}:
         # A post is a record, not a push: the other side's reply reaches this session only if it reads again.
         if a.agent=='codex':

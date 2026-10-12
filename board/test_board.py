@@ -1151,6 +1151,61 @@ class FetchTransport(Transport):
         self.assertEqual(w.returncode,0,err); self.assertIn('claim',out); self.assertIn(c['event_id'][:10],out)
 
 
+class LaunchCommand(unittest.TestCase):
+    """A request to a role prints the CLI command that opens the worker with model, effort and config dir pinned, writes
+    the hand-off text to the outbox, and --launch runs it (a stub CLI records what it got)."""
+    def test_plan_and_launch(self):
+        import os
+        td=tempfile.TemporaryDirectory(); base=Path(td.name)
+        root=base/'board'; root.mkdir(); (root/'.local').mkdir()
+        subprocess.run(['git','init','-q','-b','main',str(root)],check=True)
+        stub=base/'claude'; stub.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$STUB_OUT"; printf \'cfg=%s\\n\' "${CLAUDE_CONFIG_DIR:-}" >> "$STUB_OUT"; echo backgrounded 1234abcd\n'); stub.chmod(0o755)
+        saved={k:os.environ.get(k) for k in ('AGENT_BOARD_LAUNCH_CONFIG_DIR','AGENT_BOARD_LAUNCH_MODEL','AGENT_BOARD_LAUNCH_EFFORT','AGENT_BOARD_LAUNCH_CLI','CLAUDE_EFFORT','STUB_OUT')}
+        os.environ.update({'AGENT_BOARD_LAUNCH_CONFIG_DIR':'~/.claude-fixture','AGENT_BOARD_LAUNCH_MODEL':'claude-model-x','AGENT_BOARD_LAUNCH_CLI':str(stub),'CLAUDE_EFFORT':'high','STUB_OUT':str(base/'stub.out')})
+        os.environ.pop('AGENT_BOARD_LAUNCH_EFFORT',None)
+        try:
+            argv,env,line,path=board.launch_plan(root,'role-p-f','20260101T000000Z-claude-000001','p/spec.md',None,'claude-session-001')
+            self.assertEqual(argv[:6],[str(stub),'--bg','--model','claude-model-x','--effort','high'])
+            self.assertIn('You are the board worker for role `role-p-f`',argv[6]); self.assertIn('spec `p/spec.md`',argv[6])
+            self.assertIn('run on claude-model-x at high effort',argv[6])
+            self.assertEqual(env['CLAUDE_CONFIG_DIR'],os.path.expanduser('~/.claude-fixture')); self.assertNotIn('CLAUDECODE',env)
+            self.assertTrue(line.startswith('CLAUDE_CONFIG_DIR=')); self.assertIn('--bg --model claude-model-x --effort high "$(cat ',line)
+            self.assertEqual(path,root/'.local'/'outbox'/'20260101T000000Z-claude-000001.handoff.txt'); self.assertEqual(path.read_text(),argv[6])
+            # --expect-model wins over the default; no config dir → no prefix
+            os.environ.pop('AGENT_BOARD_LAUNCH_CONFIG_DIR')
+            argv2,env2,line2,_=board.launch_plan(root,'role-p-f','20260101T000000Z-claude-000002',None,'fable','claude-session-001')
+            self.assertEqual(argv2[2:4],['--model','fable']); self.assertNotIn('CLAUDE_CONFIG_DIR=',line2); self.assertIn('(the request itself)',argv2[-1])
+            out=board.launch(argv,env); self.assertIn('backgrounded 1234abcd',out)
+            got=(base/'stub.out').read_text().splitlines()
+            self.assertEqual(got[:5],['--bg','--model','claude-model-x','--effort','high']); self.assertEqual(got[-1],'cfg='+os.path.expanduser('~/.claude-fixture'))
+        finally:
+            for k,v in saved.items():
+                if v is None: os.environ.pop(k,None)
+                else: os.environ[k]=v
+            td.cleanup()
+
+
+class LaunchCommandCLI(Transport):
+    """The request command prints the launch line for a role address and nothing for a native one."""
+    def test_request_to_role_prints_launch_line(self):
+        import sys, os
+        script=board.ENGINE/'board.py'
+        def cli(*args):
+            p=subprocess.run([sys.executable,str(script),*args],capture_output=True,text=True); self.assertEqual(p.returncode,0,p.stderr); return p.stdout
+        base=['--root',str(self.root),'--agent','claude','--session','claude-win-9','--source',str(self.root),'--policy','encrypted-metadata-only']
+        saved=os.environ.get('AGENT_BOARD_LAUNCH_MODEL'); os.environ['AGENT_BOARD_LAUNCH_MODEL']='claude-model-y'
+        try:
+            out=cli('request',*base,'--thread','r-00112233aabb','--to','claude','--to-session','role-q-work')
+            self.assertIn('受け手を起こす',out); self.assertIn('--bg --model claude-model-y',out); self.assertIn('.handoff.txt',out)
+            rid=next(l.split('=',1)[1] for l in out.splitlines() if l.startswith('event_id='))
+            hp=board.outbox_dir(self.root)/(rid+'.handoff.txt'); self.assertTrue(hp.is_file()); self.assertIn(rid,hp.read_text())
+            out2=cli('request',*base,'--thread','r-00112233aabc','--to','claude','--to-session','claude-win-other')
+            self.assertNotIn('受け手を起こす',out2)
+        finally:
+            if saved is None: os.environ.pop('AGENT_BOARD_LAUNCH_MODEL',None)
+            else: os.environ['AGENT_BOARD_LAUNCH_MODEL']=saved
+
+
 class TransportClone(Transport):
     """The previous transport (AGENT_BOARD_TRANSPORT=clone) still passes the transport tests."""
     def setUp(self):

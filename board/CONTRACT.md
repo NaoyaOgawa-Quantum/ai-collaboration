@@ -391,15 +391,22 @@ python3 board_items.py list    --root <board>
 - <a id="standing-reviewer-role"></a>**A standing reviewer for an owner's board**: `role-<project>-owner-review`
   (see `--reviewer` above); the owner's wiring may set it as the default so no request's receipt depends on one
   window staying open.
-- <a id="worker-handoff-text"></a>**Hand-off text for a worker someone will start**: post the `request` first and put
-  its event id in the text, with the role id, the spec path, and the model and reasoning effort the window must run
-  with (in the pasted text itself, not only in a note to the owner: a window runs on whatever model it happens to
-  have, measured). The text: "You are the board worker for role `<role id>`,
-  request `<request event id>`, spec `<path>`; execute it yourself. 1. `inbox --session <role id> --sync`; if the
-  request is not visible, do not read the spec — ask the requester or `watch`. 2. `claim` with
-  `--session-name '<native id, 8 chars> (<model>)'`; if refused with *another live claim exists*, stop and say so in
-  one line." The native id in the name lets a second worker under the same role see the claim is not its own. For a
-  cross-vendor pass on a copy of a repository, also follow
+- <a id="worker-handoff-text"></a>**Starting the worker a role names**: a `request --to claude --to-session role-…`
+  writes the hand-off text to the outbox (`<request id>.handoff.txt`) and prints one shell line that opens the worker
+  as a background CLI session with its model, reasoning effort and config dir pinned —
+  `CLAUDE_CONFIG_DIR=<dir> claude --bg --model <m> --effort <e> "$(cat <file>)"` — and `--launch` runs it at once.
+  Model = `--expect-model`, else `AGENT_BOARD_LAUNCH_MODEL`, else the requester's own model; effort =
+  `AGENT_BOARD_LAUNCH_EFFORT`, else the requester's `CLAUDE_EFFORT`; config dir = `AGENT_BOARD_LAUNCH_CONFIG_DIR`
+  (the owner's wiring names a logged-in account: measured, a machine's default config dir was not logged in and the
+  window opened on usage billing). The text itself: "You are the board worker for role `<role id>`, request
+  `<request event id>`, spec `<path>`; execute it yourself. This window must run on <model> at <effort> effort.
+  1. `inbox --session <role id> --sync`; if the request is not visible, do not read the spec — ask the requester or
+  `watch`. 2. `claim` with `--session-name '<native id, 8 chars> (<model>)'`; if refused with *another live claim
+  exists*, stop and say so in one line. 3. Do the work; `submit` with the deliverable paths." Paste that file's text
+  only into a window opened by other means (a desktop window someone wants to steer, another machine): a window runs
+  on whatever model it happens to have (measured), so the model and effort are in the text as well. The native id in
+  the name lets a second worker under the same role see the claim is not its own. For a cross-vendor pass on a copy
+  of a repository, also follow
   [`physics-verification-cycle.md#cross-vendor-repo-copy`](../conventions/physics-verification-cycle.md#cross-vendor-repo-copy).
 - <a id="role-claim-is-not-assignment"></a>**A self-declared role is not an assignment**: "this session is the review
   window for X" or "ask me before touching Y" in another session's note is that session's statement. Before
