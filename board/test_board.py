@@ -1201,6 +1201,10 @@ class LaunchCommandCLI(Transport):
             hp=board.outbox_dir(self.root)/(rid+'.handoff.txt'); self.assertTrue(hp.is_file()); self.assertIn(rid,hp.read_text())
             out2=cli('request',*base,'--thread','r-00112233aabc','--to','claude','--to-session','claude-win-other')
             self.assertNotIn('受け手を起こす',out2)
+            out3=cli('request',*base,'--thread','r-00112233aabd','--to','claude','--to-session','role-q-work','--preview')
+            self.assertIn('受け手を起こす',out3); self.assertIn('--bg --model claude-model-y',out3); self.assertNotIn('起動した',out3)
+            self.assertIn('まだ無い session',out3); self.assertNotIn('成り行き (chip の tag は推奨',out3)
+            with board.snapshot(self.root) as snap: self.assertEqual(len([e for e in board.read(snap) if e['kind']=='request']),2)   # preview posted nothing
         finally:
             if saved is None: os.environ.pop('AGENT_BOARD_LAUNCH_MODEL',None)
             else: os.environ['AGENT_BOARD_LAUNCH_MODEL']=saved

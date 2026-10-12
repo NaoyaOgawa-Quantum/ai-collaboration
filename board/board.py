@@ -566,7 +566,8 @@ def target_model_note(to_session, expect=None, agent=None):
     """
     if not to_session: return None
     if to_session.startswith(('role-','resident-')):
-        return f"宛先 {to_session} は役割 id = 開く session の model は成り行き (chip の tag は推奨、 起票元と同じ model が既定)。 仕事の難しさに合う model で開くよう文面に書く。"
+        return (f"宛先 {to_session} は役割 id = まだ無い session。 この request が出す起動の 1 行で開けば model と effort は固定"
+                f" (--expect-model か owner の既定、 無ければ起票元と同じ)。 手で開く窓 (chip・別の機械) では成り行き = hand-off 文の model の行が頼り。")
     if agent=='codex':
         got=codex_target_model(to_session)
         if not got:
@@ -716,6 +717,18 @@ def launch_plan(root, role, request_id, spec, expect, session):
     line=((f'CLAUDE_CONFIG_DIR={shlex.quote(cfg)} ' if cfg else '')+shlex.quote(cli)+' --bg'+(f' --model {shlex.quote(model)}' if model else '')
           +(f' --effort {shlex.quote(effort)}' if effort else '')+f' "$(cat {shlex.quote(str(path))})"')
     return argv,env,line,path
+
+
+def announce_launch(a, ev):
+    """For a request addressed to a Claude role: write the hand-off file, print the launch line, return (argv, env);
+    None otherwise. Printed on --preview too (the command is part of what the requester reviews before posting)."""
+    if a.command!='request' or a.to!='claude' or not (a.to_session or '').startswith('role-'): return None
+    # A role names a window nobody has opened: print the command that opens it with model, effort and account
+    # pinned (measured: the chip opens on the parent's model, and a pasted hand-off ran on whatever the window had).
+    argv,env,line,hpath=launch_plan(a.root,a.to_session,ev['event_id'],(a.reference or [None])[0],a.expect_model,a.session)
+    print(f'→ 受け手を起こす (model・effort・account を固定、 貼り付け不要。 依頼元の shell でそのまま):\n  {line}')
+    print(f'  (hand-off 文 = {hpath}。 desktop の窓で steer したいときだけ chip、 その文面もこの file)')
+    return argv,env
 
 
 def launch(argv, env):
@@ -1083,7 +1096,9 @@ def main():
         same=[e for e in events if e['project']['key']==ev['project']['key'] and e['thread_id']==ev['thread_id']]
         probs+=reduce_workflow(same+[ev],view.now_utc())['errors']
         if probs: raise ValueError('; '.join(probs))
-        print(json.dumps(ev,ensure_ascii=False,indent=2)); return
+        print(json.dumps(ev,ensure_ascii=False,indent=2))
+        announce_launch(a,ev)   # shown, not run: the requester sees the command it will get
+        return
     from board_schema import errors
     probs=errors(ev,json.loads(SCHEMA_PATH.read_text()))
     if probs: raise ValueError('; '.join(probs))
@@ -1134,14 +1149,9 @@ def main():
             probs=errors(hev,json.loads(SCHEMA_PATH.read_text()))+[x for x in reduce_workflow(same+[ev,hev],view.now_utc())['errors'] if x.startswith(hev['event_id']+':')]
             if probs: raise ValueError('reviewer handover: '+'; '.join(probs))
             print('posted '+post(a.root,hev)+f' (検収役 = {a.agent}/{reviewer}: 提出は inbox --session {reviewer} に載る。 受領は --session {reviewer} --session-name \'<native id 8 chars> (<model>)\' で accept / revise)')
-        if a.to=='claude' and (a.to_session or '').startswith('role-'):
-            # A role names a window nobody has opened: print the command that opens it with model, effort and account
-            # pinned (measured: the chip opens on the parent's model, and a pasted hand-off ran on whatever the window had).
-            argv,env,line,hpath=launch_plan(a.root,a.to_session,ev['event_id'],(a.reference or [None])[0],a.expect_model,a.session)
-            print(f'→ 受け手を起こす (model・effort・account を固定、 貼り付け不要。 依頼元の shell でそのまま):\n  {line}')
-            print(f'  (hand-off 文 = {hpath}。 desktop の窓で steer したいときだけ chip、 その文面もこの file)')
-            if a.launch:
-                print('→ 起動した: '+launch(argv,env).replace('\n','\n  '))
+        plan=announce_launch(a,ev)
+        if plan and a.launch:
+            print('→ 起動した: '+launch(*plan).replace('\n','\n  '))
     if rid and a.command in {'request','claim','submit','blocker','revise','update'}:
         # A post is a record, not a push: the other side's reply reaches this session only if it reads again.
         if a.agent=='codex':
