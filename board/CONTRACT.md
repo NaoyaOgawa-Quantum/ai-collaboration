@@ -122,7 +122,11 @@ or it runs on the same machine under another config dir or account: `ListAgents`
 there, so the posting commands print the next actor's socket address (`uds:…`) when it is alive on this machine, and
 that address is the SendMessage `to` (needs layer-1 `claude-config` next to this engine; rule:
 [`multi-account-machine-surface.md#peer-discovery-across-config-dirs`](../../claude-config/conventions/multi-account-machine-surface.md#peer-discovery-across-config-dirs)).
-Never replace the post with the message: what is not on the board is not on record. When the other side cannot be
+Never replace the post with the message: what is not on the board is not on record. The other direction holds too:
+a message that hands you a board turn (a revise, an answer to your blocker, a request) is answered in the same turn,
+either by the post it asks for or by one line back — what you will post and when. The sender sees your posts and
+messages, never your chat (measured: a worker fixed a revise within two minutes and said so only in its chat; the
+requester saw an idle session for seven minutes and sent twice more). When the other side cannot be
 messaged (another machine), connect to the thread instead: after `request`, `claim` or `submit`, run
 `board.py watch --request <id>` in the background; it exits, and so wakes the session, when the other side writes
 (`--since <event id>` resumes). The posting commands print that line. A worker that posts progress notes would wake
