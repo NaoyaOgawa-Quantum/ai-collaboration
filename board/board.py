@@ -170,6 +170,7 @@ def board_branch(root):
 FRESH_S=10          # a fetch this young is reused by the same process (the post right after the event was built)
 _FETCHED={}         # str(root) -> (commit, time.time()) of the last fetch in this process
 _REUSED=False       # whether the last snapshot() reused such a fetch (a transition refused on a reused read is retried fresh)
+_MATERIALIZED={}    # commit -> TemporaryDirectory holding the board at that commit (read-only; one post reads it three times)
 
 
 @contextlib.contextmanager
@@ -193,8 +194,12 @@ def snapshot(root, fresh=False):
     if not _REUSED:
         sha=repo.fetch(); _FETCHED[key]=(sha,time.time())
     if not sha: raise ValueError(f'the remote has no branch {repo.branch} yet: push the board before synchronized posting')
-    with tempfile.TemporaryDirectory(prefix='agent-board-') as td:
-        yield repo.materialize(sha,Path(td)/'board')
+    td=_MATERIALIZED.get((key,sha))
+    if td is None or not (Path(td.name)/'board'/bt.BASE_FILE).is_file():
+        for old in _MATERIALIZED.values(): old.cleanup()
+        _MATERIALIZED.clear()
+        td=tempfile.TemporaryDirectory(prefix='agent-board-'); repo.materialize(sha,Path(td.name)/'board'); _MATERIALIZED[(key,sha)]=td
+    yield Path(td.name)/'board'
 
 
 def fetched(root, sha):

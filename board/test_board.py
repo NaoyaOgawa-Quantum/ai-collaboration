@@ -693,8 +693,10 @@ class History(unittest.TestCase):
 
 class Transport(unittest.TestCase):
     def setUp(self):
+        import os
         self.tmp=tempfile.TemporaryDirectory(prefix='board-test-'); self.base=Path(self.tmp.name)
         self.root=self.base/'source'; self.remote=self.base/'remote.git'
+        self._cache_saved=os.environ.get('AGENT_BOARD_CACHE_DIR'); os.environ['AGENT_BOARD_CACHE_DIR']=str(self.base/'cache')   # never the user's ~/.cache
         subprocess.run(['git','init','--bare','-q',str(self.remote)],check=True)
         subprocess.run(['git','init','-q','-b','main',str(self.root)],check=True)
         for k,v in [('user.name','Fixture'),('user.email','fixture@example.invalid')]: board.run(self.root,'config',k,v)
@@ -703,7 +705,11 @@ class Transport(unittest.TestCase):
         (self.root/'board.json').write_text(json.dumps({'board_format':1,'audience':'owner','encryption':'git-crypt'}))
         board.run(self.root,'add','.gitattributes','board.json'); board.run(self.root,'commit','-q','-m','Initialize fixture')
         board.run(self.root,'remote','add','origin',str(self.remote)); board.run(self.root,'push','-u','origin','main')
-    def tearDown(self): self.tmp.cleanup()
+    def tearDown(self):
+        import os
+        self.tmp.cleanup()
+        if self._cache_saved is None: os.environ.pop('AGENT_BOARD_CACHE_DIR',None)
+        else: os.environ['AGENT_BOARD_CACHE_DIR']=self._cache_saved
     def test_encrypted_roundtrip_and_unchanged_caller_index(self):
         (self.root/'unrelated.txt').write_text('Other agent work'); board.run(self.root,'add','unrelated.txt')
         before=board.run(self.root,'diff','--cached','--raw').stdout
@@ -851,10 +857,13 @@ class CollaboratorBoards(unittest.TestCase):
         self.proj=repo('proj',{'CLAUDE.md':'shared project','notes/a.md':'x','board/board.json':json.dumps(collab)})
         self.private=repo('private-notes',{'CLAUDE.md':'owner only','plan.md':'x'})
         self.saved=os.environ.get('AGENT_BOARD_WORKSPACE'); os.environ['AGENT_BOARD_WORKSPACE']=str(self.ws)
+        self._cache_saved=os.environ.get('AGENT_BOARD_CACHE_DIR'); os.environ['AGENT_BOARD_CACHE_DIR']=str(base/'cache')
     def tearDown(self):
         import os
         if self.saved is None: os.environ.pop('AGENT_BOARD_WORKSPACE',None)
         else: os.environ['AGENT_BOARD_WORKSPACE']=self.saved
+        if self._cache_saved is None: os.environ.pop('AGENT_BOARD_CACHE_DIR',None)
+        else: os.environ['AGENT_BOARD_CACHE_DIR']=self._cache_saved
         self.tmp.cleanup()
     def cli(self, *args, check=True):
         p=subprocess.run([self.sys.executable,str(board.ENGINE/'board.py'),*args],capture_output=True,text=True)
