@@ -188,7 +188,9 @@ def snapshot(root):
         if bc.is_locked(board_dir):
             key=common/'git-crypt/keys/default'
             if not key.is_file(): raise ValueError('unlock the source board before using synchronized posting')
-            p=subprocess.run(['git-crypt','unlock',str(key)],cwd=dest,capture_output=True,timeout=30)
+            # unlock smudges every tracked file, one git-crypt process each: ~30 ms per event file, so a board of
+            # ~1000 events takes ~30 s (measured 2026-10-12: 986 files, 32 s). The old 30 s limit refused every post.
+            p=subprocess.run(['git-crypt','unlock',str(key)],cwd=dest,capture_output=True,timeout=600)
             if p.returncode: raise ValueError('temporary board could not be unlocked')
         yield board_dir
 
