@@ -112,6 +112,17 @@ path holds it; later declarers queue; a set older than `--hours` stops holding s
 forever. Paths are normalised below the workspace with symlinks resolved; credential repositories and paths outside
 the workspace are refused; git-crypt files are posted as `h:<hash>`. It is a declaration, not a lock.
 
+## <a id="item-claims"></a>Item claims
+
+Two sessions opened in one workspace received the same pending items and each was told to handle them; both read the
+same mail and filed two ledger entries for it (実測). A touch reserves a path and a v2 claim reserves a request; a
+pending item is neither. `board_items.py` keeps the claims in a checkout-local ledger with a lock: same-machine
+sessions see a claim at once, with no network and no sync, and an end-of-turn hook can afford to read it on every
+turn. Rejected: posting each claim as an event (a post clones the whole board, so a claim made at the end of a turn
+would cost tens of seconds and grow history by one or two events per handled item); the liveness rule inside the
+engine (only the caller knows how its runtime registers live sessions). The module does not import `board.py`; its
+only tie to the rest of the engine is the ledger location, so a redesign of posting leaves it alone.
+
 ## <a id="session-start-surface"></a>Session-start surface
 
 `board-session-start.py` puts the surfaced threads at the top of a new session. The script is shared and the hook

@@ -21,6 +21,7 @@ board/
   board_workflow.py  # the v2 request/receipt reducer (single state authority)
   board_schema.py    # dependency-free strict schema validator
   board_config.py    # board.json, board selection, discovery, reader gate, scaffold
+  board_items.py     # item claims among parallel sessions on one machine (checkout-local ledger, not posted)
   schema/event.schema.json
   test_board.py      # behaviour, encrypted transport, races, collaborator boards
 ```

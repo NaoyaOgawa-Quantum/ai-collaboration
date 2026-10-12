@@ -67,7 +67,7 @@ layer 1 (public、全 Claude Code / Codex ユーザー向け)。**依存でき�
 ```bash
 set -e
 for s in scripts/*.py; do python3 "$s" --selftest; done
-python3 board/board-view.py --selftest && python3 board/board-session-start.py --selftest && python3 board/test_board.py   # git-crypt が要る (暗号化 transport の試験)
+python3 board/board-view.py --selftest && python3 board/board-session-start.py --selftest && python3 board/test_board.py && python3 board/board_items.py --selftest   # git-crypt が要る (暗号化 transport の試験)
 ```
 
 CI = `.github/workflows/checks.yml` (全 script の selftest。`secure-new-repo.sh --code` の baseline)。 `board/` の試験は CI に未配線 = 手元で回す (配線は本人の裁定待ち)。失敗した script の終了値を loop で失わない。

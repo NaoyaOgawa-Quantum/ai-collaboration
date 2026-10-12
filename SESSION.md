@@ -2,6 +2,12 @@
 
 > 📌 SESSION.md = 案件ごとの現在地 + 正本への link (進んだら置き換える、 日付を見出しにした節・commit hash・messageId を置かない = 層1 claude-config/CONVENTIONS.md#session-no-durable-record)。 日付つきの節は SESSION-archive.md へ verbatim MOVE 済 (2026-09-28)。
 
+## 現在地：並列 session の用事の claim
+
+`board/board_items.py` を足した (掲示板の checkout の手元の台帳、 `board.py` は不変更)。 使い方は
+[CONTRACT](board/CONTRACT.md#item-claims)、 採らなかった案は [DESIGN](board/DESIGN.md#item-claims)。
+別の機械への写しは無い = 掲示板の見直しの結論が出てから決める。
+
 ## 現在地：Lindblad 観測量の検査
 
 再利用 API と合成 selftest を整備した。次の利用では、

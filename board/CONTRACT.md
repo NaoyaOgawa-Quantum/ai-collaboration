@@ -320,6 +320,33 @@ python3 board.py untouch --root <board> --agent claude --policy ordinary --proje
 - Holding a file does not make another session's uncommitted hunks yours: commit with the race defences of layer-1
   `multi-session-coordination.md#staging-window-race`.
 
+## <a id="item-claims"></a>Claiming a pending item that is not a file
+
+When several sessions on one machine receive the same list of pending items (a mail thread, a ledger entry, a request)
+from a start-of-session surface or an end-of-turn check, the first session to start on an item claims it; the others
+show who is on it instead of handling it again. A touch names a path; an item claim names a key the caller chooses.
+
+```sh
+python3 board_items.py hold    --root <board> --key mail:<id> --key todo:<id> --label '<short>'   # 2 = another session holds it
+python3 board_items.py held    --root <board> --key mail:<id>                                       # who else holds it
+python3 board_items.py release --root <board>                                                       # everything this session holds
+python3 board_items.py list    --root <board>
+```
+
+- The keys passed to one `hold` are aliases of one item (a reply, its thread and its ledger entry): all are taken or
+  none. The first holder keeps the item; holding again renews the lease (default 90 minutes).
+- A claim stops holding when its lease ends, when it is released, or when the caller's liveness test reports the
+  holder session ended (the Python API takes `alive(claim)`; the CLI applies none). The item then reappears everywhere:
+  nothing is silently dropped.
+- The ledger is local state of the board checkout (`.local/items.json`, or under the Git directory), shared at once by
+  every session that uses the checkout. It is not posted: a claim lasts minutes, and posting each one would grow history
+  by an event or two per handled item (a post also costs a fresh checkout of the board today). Other machines learn of
+  the work from its record once that is pushed.
+- Callers: an end-of-turn check claims the items it is about to demand and does not demand an item another live
+  session holds; a surface appends the holder to such lines; a record tool claims what it records and refuses to write
+  an item another live session holds. General rule: layer-1
+  [`multi-session-coordination.md#pending-item-claims`](../../claude-config/conventions/multi-session-coordination.md#pending-item-claims).
+
 ## <a id="session-directory-and-roles"></a>Session directory, names and role identities
 
 - **Who is out there**: `board.py sessions --sync` prints every (agent, session_id) seen in history with its name,
@@ -379,7 +406,7 @@ python3 board-view.py --all-boards --surface --json      # dashboards: every boa
 python3 board-view.py --board <name> --validate          # schema + protocol + paths
 python3 board-html.py --board <name> --sync --open       # static snapshot (~/.cache/agent-board/<name>.html)
 python3 board-serve.py --board <name>                    # localhost live view; reload synchronises
-python3 board-view.py --selftest && python3 board-session-start.py --selftest && python3 test_board.py
+python3 board-view.py --selftest && python3 board-session-start.py --selftest && python3 test_board.py && python3 board_items.py --selftest
 ```
 
 <a id="session-start-surface"></a>To show pending threads at the top of every new session, wire
