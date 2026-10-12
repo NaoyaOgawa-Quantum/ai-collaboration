@@ -74,8 +74,8 @@ python3 <engine>/board.py init --root <workspace>/<project>/board --audience col
 - Posts are commits on the project's branch (`Add event`, paths below `board/events/`). Collaborators' normal pulls
   bring them; a push rejected because a post landed in between is resolved by the usual pull --rebase. If the
   project's CI runs on every push, exclude `board/**`.
-- The writer clones the project partially (commits and trees, no file contents) and checks out only `board/`, so a
-  large project costs seconds, not its size.
+- The writer fetches the project's branch into the collaborator's own checkout and reads and writes `board/` through
+  its object store (the project's working tree is not moved), so a large project costs one round trip, not its size.
 - Choose a **companion repository** instead (`<project>-board`, same members, `board.json` at its root) when the
   project's history must stay free of board commits, or when the readers differ from the project's members.
 
@@ -126,7 +126,9 @@ Never replace the post with the message: what is not on the board is not on reco
 a message that hands you a board turn (a revise, an answer to your blocker, a request) is answered in the same turn,
 either by the post it asks for or by one line back — what you will post and when. The sender sees your posts and
 messages, never your chat (measured: a worker fixed a revise within two minutes and said so only in its chat; the
-requester saw an idle session for seven minutes and sent twice more). When the other side cannot be
+requester saw an idle session for seven minutes and sent twice more). A sender that hears nothing reads the
+receiver's posts and commits before concluding the message did not arrive: an idle row in a session list only
+says the receiver is between turns (in that case the message had arrived in seconds and the fix was committed). When the other side cannot be
 messaged (another machine), connect to the thread instead: after `request`, `claim` or `submit`, run
 `board.py watch --request <id>` in the background; it exits, and so wakes the session, when the other side writes
 (`--since <event id>` resumes). The posting commands print that line. A worker that posts progress notes would wake
@@ -163,8 +165,8 @@ Operating facts (measured):
   the project's checkout, so there the working tree is stale right after a post — read back with `--sync`.
   `AGENT_BOARD_TRANSPORT=clone` selects the previous transport (a temporary clone, decrypting every file) for one
   release; the events, paths and commits are the same either way.
-- Inside the Codex sandbox (`workspace-write`) there is no network: `--sync`, `--preview` and every post clone the
-  remote and fail until the command is approved to run outside the sandbox. Reads of the local checkout
+- Inside the Codex sandbox (`workspace-write`) there is no network: `--sync`, `--preview` and every post fetch or push
+  and fail until the command is approved to run outside the sandbox. Reads of the local checkout
   (`inbox` without `--sync`, `board-view.py --surface`) work there.
 - `handover` needs `--reply-to <request id>`. A session about to close hands the requests it reviews to its
   successor with `handover --role reviewer`. A reviewer whose session has died is replaced by a `human` handover on

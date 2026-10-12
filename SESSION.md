@@ -45,6 +45,8 @@ owner 専用の掲示板から engine を移し、 共同研究の repo に層2 
 
 - [ ] Phase 2 の trigger 監視 (= DESIGN の表): Codex runner Pilot A 開始で `multi-session-coordination.md` と `codex/` を移設
 
+- [ ] 掲示板の旧 transport (一時 clone + 全 file の復号 = `board.py` の `snapshot_clone` / `_post_clone`、 `AGENT_BOARD_TRANSPORT=clone`、 test の `*Clone` class) を消す: trigger = 掲示板を使う全機械の engine の checkout が fetch の transport 以降になり、 1 版の間に切り戻しが要らなかったこと。 判断と測定 = [board/DESIGN.md](board/DESIGN.md) の Concurrency and delivery
+
 ## 決定ログ
 
 - **2026-09-06: 新設** — 判断は DESIGN.md (分離の理由 / Phase 1 の範囲 / 移し方 = format-patch 履歴 import / stub + forwarder / Phase 2 trigger)

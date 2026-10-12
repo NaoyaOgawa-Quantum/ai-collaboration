@@ -10,8 +10,8 @@
 `board-view.py --all-boards --sync --surface` を workspace (AGENT_BOARD_WORKSPACE、 無ければこの engine の checkout
 の親) に対して走らせ、 Claude Code の hook JSON を出す: 人に見せる 1 行 (`systemMessage`) と、 model に渡す
 要注意 thread の一覧 (`additionalContext`)。 要注意の thread が無ければ何も出さない。
---sync は掲示板ごとに remote を読むので、 掲示板の数だけ時間が伸びる (掲示板 2 つで約 22 秒の実測)。 上限 (--timeout)
-に近い machine では --no-sync で手元の checkout を読む。
+--sync は掲示板ごとに remote を 1 往復読むので、 掲示板の数だけ時間が伸びる (fetch の transport で 1 枚 2 秒前後の実測。
+旧 transport = 一時 clone + 全 file の復号 では 2 枚で約 22 秒だった)。 上限 (--timeout) に近い machine では --no-sync で手元の checkout を読む。
 
 意図して黙る場合:
 - AGENT_BOARD_SESSION_START=0 (1 回の起動、 または 1 台の machine で止める)。

@@ -156,8 +156,8 @@ Two sessions opened in one workspace received the same pending items and each wa
 same mail and filed two ledger entries for it (実測). A touch reserves a path and a v2 claim reserves a request; a
 pending item is neither. `board_items.py` keeps the claims in a checkout-local ledger with a lock: same-machine
 sessions see a claim at once, with no network and no sync, and an end-of-turn hook can afford to read it on every
-turn. Rejected: posting each claim as an event (a post clones the whole board, so a claim made at the end of a turn
-would cost tens of seconds and grow history by one or two events per handled item); the liveness rule inside the
+turn. Rejected: posting each claim as an event (each handled item would grow history by one or two events, and a
+claim made at every turn's end would pay a network round trip); the liveness rule inside the
 engine (only the caller knows how its runtime registers live sessions). The module does not import `board.py`; its
 only tie to the rest of the engine is the ledger location, so a redesign of posting leaves it alone.
 
