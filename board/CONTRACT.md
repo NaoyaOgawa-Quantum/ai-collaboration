@@ -361,7 +361,10 @@ python3 board_items.py list    --root <board>
   by an event or two per handled item. Other machines learn of the work from its record once that is pushed.
 - Callers: an end-of-turn check claims the items it is about to demand and does not demand an item another live
   session holds; a surface appends the holder to such lines; a record tool claims what it records and refuses to write
-  an item another live session holds. General rule: layer-1
+  an item another live session is working on; a session-end hook releases what the session held. A claim may carry a
+  kind in an extra field (`hold(..., extra={'kind': ...})`; the engine does not read it): `work` (the session handles
+  the item) or `relay` (it only told its user). A relay claim keeps other sessions from telling the user again but
+  does not stop them handling the item. General rule: layer-1
   [`multi-session-coordination.md#pending-item-claims`](../../claude-config/conventions/multi-session-coordination.md#pending-item-claims).
 
 ## <a id="session-directory-and-roles"></a>Session directory, names and role identities
