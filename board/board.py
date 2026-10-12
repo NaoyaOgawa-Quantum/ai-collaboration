@@ -31,6 +31,7 @@ LAUNCH_CONFIG_DIR_ENV='AGENT_BOARD_LAUNCH_CONFIG_DIR'  # request to a role: the 
 LAUNCH_MODEL_ENV='AGENT_BOARD_LAUNCH_MODEL'            # request to a role: default --model (else --expect-model, else the requester's own model)
 LAUNCH_EFFORT_ENV='AGENT_BOARD_LAUNCH_EFFORT'          # request to a role: default --effort (else the requester's CLAUDE_EFFORT)
 LAUNCH_CLI_ENV='AGENT_BOARD_LAUNCH_CLI'                # the CLI executable (default `claude`; tests point it at a stub)
+LAUNCH_DEFAULT_ENV='AGENT_BOARD_LAUNCH_DEFAULT'        # `1` = a request to a role starts the worker at once unless --no-launch (owner wiring)
 
 
 def run(root, *args, check=True):
@@ -173,19 +174,22 @@ def board_branch(root):
 
 
 FRESH_S=10          # a fetch this young is reused by the same process (the post right after the event was built)
+OPTIMISTIC_S=60     # a post trusts the branch head this machine fetched or pushed this recently (any process); a rejected push fetches
 _FETCHED={}         # str(root) -> (commit, time.time()) of the last fetch in this process
 _REUSED=False       # whether the last snapshot() reused such a fetch (a transition refused on a reused read is retried fresh)
-_MATERIALIZED={}    # commit -> TemporaryDirectory holding the board at that commit (read-only; one post reads it three times)
 
 
 @contextlib.contextmanager
-def snapshot(root, fresh=False):
-    """The board as the remote holds it now, as a temporary board directory (board.json + events/) that `read` reads.
+def snapshot(root, fresh=False, optimistic=False):
+    """The board as the remote holds it now, as a read-only board directory (board.json + events/) that `read` reads.
 
-    Default transport (board_transport): one `git fetch`, then the fetched tree is written out as plain files, each
-    event decrypted once per machine and cached by blob id — seconds, independent of the board's size. `fresh=True`
-    forces a new fetch (a rejected push); otherwise a fetch younger than FRESH_S in this process is reused.
-    `AGENT_BOARD_TRANSPORT=clone` keeps the previous transport (snapshot_clone) for one release.
+    Default transport (board_transport): one `git fetch`, then the fetched commit's tree as a persistent directory
+    built once per machine from the blob cache (each event decrypted once, hard-linked) — seconds, independent of the
+    board's size. `fresh=True` forces a new fetch (a rejected push); otherwise a fetch younger than FRESH_S in this
+    process is reused, and with `optimistic=True` so is a branch head this machine fetched or pushed within
+    OPTIMISTIC_S (posts: the push rejects a stale base, and the caller then reads fresh — one round trip saved on
+    every post while a watch or a recent post keeps the machine current). Synchronized reads (`--sync`) never pass
+    optimistic. `AGENT_BOARD_TRANSPORT=clone` keeps the previous transport (snapshot_clone) for one release.
     Neither transport touches the caller's index or working tree while reading.
     """
     if bt.transport()=='clone':
@@ -196,15 +200,12 @@ def snapshot(root, fresh=False):
     sha,at=_FETCHED.get(key,('',0.0))
     global _REUSED
     _REUSED=not (fresh or not sha or time.time()-at>FRESH_S)
+    if not _REUSED and optimistic and not fresh and repo.fetched_age()<OPTIMISTIC_S:
+        sha=repo.remote_sha(); _REUSED=bool(sha)
     if not _REUSED:
         sha=repo.fetch(); _FETCHED[key]=(sha,time.time())
     if not sha: raise ValueError(f'the remote has no branch {repo.branch} yet: push the board before synchronized posting')
-    td=_MATERIALIZED.get((key,sha))
-    if td is None or not (Path(td.name)/'board'/bt.BASE_FILE).is_file():
-        for old in _MATERIALIZED.values(): old.cleanup()
-        _MATERIALIZED.clear()
-        td=tempfile.TemporaryDirectory(prefix='agent-board-'); repo.materialize(sha,Path(td.name)/'board'); _MATERIALIZED[(key,sha)]=td
-    yield Path(td.name)/'board'
+    yield repo.materialized(sha)
 
 
 def fetched(root, sha):
@@ -385,7 +386,7 @@ def _post_fetch(root, event, rel, *, before_push=None, landed=None):
     encrypted='git-crypt' in run(repo.top,'check-attr','filter','--',repo.prefix+str(rel)).stdout.decode()
     text=(json.dumps(event,ensure_ascii=False,indent=2)+'\n').encode()
     for attempt in range(3):
-        with snapshot(root,fresh=attempt>0) as dest:
+        with snapshot(root,fresh=attempt>0,optimistic=attempt==0) as dest:
             if not (dest/bc.CONFIG).is_file():
                 # Fail closed: an unpushed local board.json must not decide who reads a post (measured: a migration window).
                 raise ValueError(f'the remote of this board has no {bc.CONFIG} yet: commit and push it before posting')
@@ -731,9 +732,10 @@ def announce_launch(a, ev):
     return argv,env
 
 
-def launch(argv, env):
-    """Start the worker now; returns the CLI's output (the background session id and the attach/logs/stop lines)."""
-    p=subprocess.run(argv,env=env,capture_output=True,text=True,timeout=120)
+def launch(argv, env, cwd=None):
+    """Start the worker now (in the workspace, so the projects' instructions load); returns the CLI's output (the
+    background session id and the attach/logs/stop lines)."""
+    p=subprocess.run(argv,env=env,cwd=str(cwd) if cwd else None,capture_output=True,text=True,timeout=120)
     if p.returncode: raise ValueError('launch failed: '+(p.stderr or p.stdout)[-800:])
     return (p.stdout or '').strip()
 
@@ -885,6 +887,7 @@ def main():
     ap.add_argument('--include-closed',action='store_true',help='inbox: also show completed requests involving this exact session (not actionable)')
     ap.add_argument('--interval',type=float,default=30,help='watch: seconds between remote checks (default transport: one ls-remote round trip, a read only when the branch moved; clone transport: a full read)')
     ap.add_argument('--launch',action='store_true',help='request to a role: start the worker now with the printed CLI command (background session; the id is printed)')
+    ap.add_argument('--no-launch',action='store_true',help=f'request to a role: only print the command even when {LAUNCH_DEFAULT_ENV}=1')
     ap.add_argument('--reviewer',help='request: the session that receives the submission (default: the requester; env '
                     f'{DEFAULT_REVIEWER_ENV} with <project> on an owner board). A role id outlives this session; posted as a reviewer handover right after the request')
     ap.add_argument('--max-minutes',type=float,default=240,help='watch: give up after this long (exit 3)')
@@ -1059,7 +1062,10 @@ def main():
             raise ValueError('retry identity/policy differs from saved event')
         print('posted '+post(a.root,ev)); return
     labels={}
-    with snapshot(a.root) as dest:
+    for attempt in range(2):
+      # A post's own read is optimistic (no fetch when this machine fetched or pushed within OPTIMISTIC_S); an event
+      # that cannot be built against that read (a request not there yet) is rebuilt after a fresh fetch.
+      with snapshot(a.root,optimistic=attempt==0,fresh=attempt>0) as dest:
         events=read(dest)
         if touch_cmd:
             # The note restates the session's whole set in this thread (touch adds, untouch removes; nothing left = `(none)`).
@@ -1072,8 +1078,13 @@ def main():
                 new=[p for p in cur if want and not any(touch_overlaps(p,w) for w in want)]; released=[p for p in cur if p not in new]
                 a.summary=a.summary or ('手放す: '+(', '.join(released) or '(なし)'))[:1000]
             a.touch=new or [NONE_TOUCH]; a.command='note'
-        ev=event_from(a,events)
-        view.assert_writable(events, ev['project']['key'], ev['thread_id'], ev['event_id'])
+        try:
+            ev=event_from(a,events)
+            view.assert_writable(events, ev['project']['key'], ev['thread_id'], ev['event_id'])
+        except ValueError:
+            if attempt==0 and _REUSED: continue
+            raise
+      break
     # What the board's readers may see is checked before anything leaves this machine (owner boards pass).
     bc.check_post(cfg,a.root,project=ev['project']['key'],policy=a.policy,
         texts=[('--summary',ev.get('summary')),('--acceptance',ev.get('acceptance')),('--session-name',a.session_name)],
@@ -1148,8 +1159,8 @@ def main():
             if probs: raise ValueError('reviewer handover: '+'; '.join(probs))
             print('posted '+post(a.root,hev)+f' (検収役 = {a.agent}/{reviewer}: 提出は inbox --session {reviewer} に載る。 受領は --session {reviewer} --session-name \'<native id 8 chars> (<model>)\' で accept / revise)')
         plan=announce_launch(a,ev)
-        if plan and a.launch:
-            print('→ 起動した: '+launch(*plan).replace('\n','\n  '))
+        if plan and (a.launch or (os.environ.get(LAUNCH_DEFAULT_ENV,'').strip()=='1' and not a.no_launch)):
+            print('→ 起動した: '+launch(*plan,cwd=bc.workspace(a.root)).replace('\n','\n  '))
     if rid and a.command in {'request','claim','submit','blocker','revise','update'}:
         # A post is a record, not a push: the other side's reply reaches this session only if it reads again.
         if a.agent=='codex':

@@ -341,6 +341,42 @@ def handoff_lines(w):
     return lines
 
 
+def stats_text(events, now: dt.datetime, name: str = "") -> str:
+    """依頼の滞留の表 (純関数): 閉じた依頼の request→claim / claim→submit / submit→accept の時間の分布と、 開いている依頼を
+    今の状態での経過が長い順に。 止まっている依頼 (役割 id 宛てで誰も開かない・検収役が居ない) が一目で分かるための read-only の view。"""
+    from board_workflow import reduce_workflow, LABELS
+    threads: dict = {}
+    for e in events:
+        threads.setdefault((e["project"]["key"], e["thread_id"]), []).append(e)
+    spans = {"request→claim": [], "claim→submit": [], "submit→accept": [], "request→closed": []}
+    open_rows = []
+    for key, th in threads.items():
+        req = next((e for e in th if e.get("kind") == "request"), None)
+        if not req: continue
+        w = reduce_workflow(th, now)
+        t0 = parse_ts(req["created_at"])
+        claims = [e for e in th if e.get("kind") == "claim"]; subs = [e for e in th if e.get("kind") == "submit"]
+        closes = [e for e in th if e.get("kind") in ("accept", "abandoned")]
+        h = lambda a, b: (parse_ts(b["created_at"]) - parse_ts(a["created_at"])).total_seconds() / 3600
+        if claims: spans["request→claim"].append(h(req, claims[0]))
+        if claims and subs: spans["claim→submit"].append(h(claims[0], subs[-1]))
+        if subs and closes: spans["submit→accept"].append(h(subs[-1], closes[-1]))
+        if closes: spans["request→closed"].append(h(req, closes[-1]))
+        if w.get("status") not in ("accepted", "abandoned"):
+            who = w.get("waiting_on") or {}
+            age = (now - parse_ts(th[-1]["created_at"])).total_seconds() / 86400
+            open_rows.append((age, f"{key[0]}/{key[1]}", LABELS.get(w.get("status"), w.get("status")), f"{who.get('agent')}/{who.get('session_id')}"))
+    out = [f"📊 {name or 'board'}: 依頼 {sum(1 for th in threads.values() if any(e.get('kind') == 'request' for e in th))} 件 (閉じた {len(spans['request→closed'])} / 開いている {len(open_rows)})"]
+    out.append("  区間            n   中央値    p90     最大  (時間)")
+    for k, vals in spans.items():
+        if not vals: out.append(f"  {k:14s}  0"); continue
+        s = sorted(vals); med = s[len(s) // 2]; p90 = s[min(len(s) - 1, int(len(s) * 0.9))]
+        out.append(f"  {k:14s} {len(s):3d} {med:8.1f} {p90:7.1f} {s[-1]:8.1f}")
+    for age, key, label, who in sorted(open_rows, key=lambda r: -r[0]):
+        out.append(f"  ⏳ {age:5.1f} 日 [{label}] {key} → {who}")
+    return "\n".join(out)
+
+
 def derive(events: list[dict], now: dt.datetime) -> dict:
     """thread key -> state dict。"""
     threads: dict[tuple[str, str], dict] = {}
@@ -590,7 +626,27 @@ def build_template(*, kind: str, project: str, thread: str, task: str, agent: st
 
 # ---------------------------------------------------------------- selftest
 
+def _stats_selftest():
+    base = now_utc() - dt.timedelta(hours=10)
+    def ev(kind, h, thread, agent="claude", extra=None):
+        e = {"schema_version": 2, "kind": kind, "event_id": f"{compact(base + dt.timedelta(hours=h))}-{agent}-{abs(hash((kind, h, thread))) % 0xffffff:06x}",
+             "created_at": iso_z(base + dt.timedelta(hours=h)), "project": {"key": "p", "repo": None}, "thread_id": thread, "source_policy": "ordinary",
+             "actor": {"agent": agent, "session_id": f"{agent}-1", "instance": "x", "task": "t"}, "summary": "s", "references": []}
+        e.update(extra or {}); return e
+    r1 = ev("request", 0, "a", extra={"assignee": {"agent": "codex", "session_id": "codex-1"}, "acceptance": "ok"}); r1["request_id"] = r1["event_id"]
+    c1 = ev("claim", 1, "a", "codex", {"lease_until": iso_z(base + dt.timedelta(hours=30))}); c1["request_id"] = r1["event_id"]
+    s1 = ev("submit", 3, "a", "codex", {"deliverables": ["d"]}); s1.update(request_id=r1["event_id"], reply_to=c1["event_id"])
+    a1 = ev("accept", 4, "a", extra={"references": ["x"]}); a1.update(request_id=r1["event_id"], reply_to=s1["event_id"])
+    r2 = ev("request", 2, "b", extra={"assignee": {"agent": "claude", "session_id": "role-p-x"}, "acceptance": "ok"}); r2["request_id"] = r2["event_id"]
+    text = stats_text([r1, c1, s1, a1, r2], now_utc(), "demo")
+    assert "依頼 2 件 (閉じた 1 / 開いている 1)" in text, text
+    lines = {l.split()[0]: l.split()[1:] for l in text.splitlines() if l.strip().startswith(("request→", "claim→", "submit→"))}
+    assert lines["request→claim"] == ["1", "1.0", "1.0", "1.0"] and lines["claim→submit"][:2] == ["1", "2.0"] and lines["submit→accept"][:2] == ["1", "1.0"], lines
+    assert "[引受待ち] p/b → claude/role-p-x" in text and "⏳   0.3 日" in text, text
+
+
 def _selftest() -> int:
+    _stats_selftest()
     now = now_utc()
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td)
@@ -805,6 +861,7 @@ def main(argv=None) -> int:
     ap.add_argument("--project")
     ap.add_argument("--inbox", help="session ID of the receiver")
     ap.add_argument("--validate", action="store_true")
+    ap.add_argument("--stats", action="store_true", help="依頼の滞留: 遷移ごとの時間 (中央値 / p90 / 最大) と、 開いている依頼を古い順に")
     ap.add_argument("--json", action="store_true", help="派生 state を JSON で出力 (board-html.py 用)")
     ap.add_argument("--template", choices=sorted(RESTRICTED_SUMMARY))
     ap.add_argument("--thread")
@@ -861,6 +918,12 @@ def main(argv=None) -> int:
             print(f"# suggested path: {path.relative_to(root)}", file=sys.stderr)
         return 0
 
+    if a.stats:
+        if is_locked(root):
+            print(render({}, [], surface=False, project=None, now=now, locked=True, board=name)); return 0
+        events, _ = load_events(root)
+        print(stats_text(events, now, name))
+        return 0
     if a.validate:
         if is_locked(root):
             print(render({}, [], surface=False, project=None, now=now, locked=True, board=name))

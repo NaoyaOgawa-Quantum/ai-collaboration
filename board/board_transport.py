@@ -34,6 +34,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -45,6 +46,12 @@ GIT_TIMEOUT = int(os.environ.get('AGENT_BOARD_GIT_TIMEOUT', '120'))
 ORDER_FILE = '.order'   # materialised board: `<commit sha10>|<date>|<author>|<path>` per committed event, branch order
 BASE_FILE = '.base'     # materialised board: the commit it was read from
 NOTIFY_FILE = 'last-push'
+LAST_FETCH_FILE = 'last-fetch'   # when this machine last fetched or pushed the branch (any process): an optimistic post trusts a young one
+TREE_DIR = 'tree'                # <cache>/tree/<commit>/ = the board at that commit, built once from hard links to the blob cache
+TREE_KEEP = 5                    # materialised commits kept per board (older ones are removed after TREE_TTL_S)
+TREE_TTL_S = 600
+NOTIFY_HOSTS_ENV = 'AGENT_BOARD_NOTIFY_HOSTS'   # comma-separated ssh hosts whose watch is woken after a push (owner wiring)
+NOTIFY_SSH_ENV = 'AGENT_BOARD_NOTIFY_SSH'       # the ssh executable (tests point it at a stub)
 FETCH_RETRIES = 4       # two sessions fetching one repository at once: one loses the ref lock (layer-1 #concurrent-fetch-ref-lock)
 
 
@@ -120,7 +127,17 @@ class Repo:
             if 'lock' in err and i < FETCH_RETRIES - 1:
                 time.sleep(1 + i); continue
             raise ValueError('git fetch failed: ' + err[:1200])
+        self._stamp(LAST_FETCH_FILE)
         return self.remote_sha()
+
+    def _stamp(self, name):
+        try: (self.cache_dir() / name).write_text(str(time.time()) + '\n')
+        except OSError: pass
+
+    def fetched_age(self) -> float:
+        """Seconds since this machine last fetched or pushed the branch (any process); inf when never."""
+        try: return max(0.0, time.time() - float((self.cache_dir() / LAST_FETCH_FILE).read_text().strip()))
+        except (OSError, ValueError): return float('inf')
 
     def remote_sha(self) -> str:
         p = git(self.top, 'rev-parse', '--verify', '-q', self.tracking, check=False)
@@ -177,10 +194,33 @@ class Repo:
         for rel, blob in rows.items():
             if not rel.startswith('events/'): continue
             p = dest / rel; p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(self.blob(sha, rel, blob))
+            data = self.blob(sha, rel, blob)
+            try: os.link(self.cache_dir() / 'blobs' / blob, p)       # no copy: the blob cache already holds the plaintext
+            except OSError: p.write_bytes(data)
         (dest / ORDER_FILE).write_text('\n'.join(lines) + ('\n' if lines else ''))
         (dest / BASE_FILE).write_text(sha + '\n')
         return dest
+
+    def materialized(self, sha: str) -> Path:
+        """The board at commit `sha` as a persistent read-only directory under the cache, built once per machine
+        (hard links to the blob cache, so a thousand events cost a few milliseconds) and shared by every process:
+        a commit's tree never changes, so the directory is immutable once its `.base` exists. Built into a private
+        temporary name and renamed into place; older commits are pruned after TREE_TTL_S, keeping TREE_KEEP."""
+        tree = self.cache_dir() / TREE_DIR; final = tree / sha; board = final / 'board'   # `board/` like a checkout's board dir
+        if (board / BASE_FILE).is_file(): return board
+        tree.mkdir(parents=True, exist_ok=True)
+        tmp = tree / f'.tmp-{os.getpid()}-{sha}'
+        if tmp.exists(): shutil.rmtree(tmp, ignore_errors=True)
+        self.materialize(sha, tmp / 'board')
+        try: os.rename(tmp, final)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)        # another process won the race; its copy is identical
+        try:
+            dirs = sorted((d for d in tree.iterdir() if d.is_dir() and not d.name.startswith('.tmp-')), key=lambda d: d.stat().st_mtime, reverse=True)
+            for d in dirs[TREE_KEEP:]:
+                if d != final and time.time() - d.stat().st_mtime > TREE_TTL_S: shutil.rmtree(d, ignore_errors=True)
+        except OSError: pass
+        return board
 
     # ---------------------------------------------------------------- write
 
@@ -212,11 +252,34 @@ class Repo:
             if 'rejected' in err or 'fetch first' in err or 'non-fast-forward' in err: return False
             raise ValueError('git push failed: ' + err[:1200])
         git(self.top, 'update-ref', self.tracking, sha, check=False)
+        self._stamp(LAST_FETCH_FILE)
         return True
 
-    def notify(self, sha: str) -> None:
+    def notify_local(self, sha: str) -> None:
+        """Leave the pushed commit where this machine's watches look (every two seconds)."""
         try: (self.cache_dir() / NOTIFY_FILE).write_text(sha + '\n')
         except OSError: pass
+
+    def notify(self, sha: str) -> None:
+        """notify_local here, and on each host named in AGENT_BOARD_NOTIFY_HOSTS (ssh, background, fail-silent): the
+        host runs this file's `--touch-notify` for the same board path under its own home, so its watches wake in
+        seconds instead of at their next remote check. Paths must sit under the home directory on both machines."""
+        self.notify_local(sha)
+        hosts = [h.strip() for h in (os.environ.get(NOTIFY_HOSTS_ENV) or '').split(',') if h.strip()]
+        if not hosts: return
+        home = Path.home().resolve()
+        def portable(p):   # the same path under the other machine's home when it is under ours, else as it is
+            p = Path(p).resolve()
+            try: return '~/' + p.relative_to(home).as_posix()
+            except ValueError: return p.as_posix()
+        engine, root = portable(__file__), portable(self.root)
+        ssh = os.environ.get(NOTIFY_SSH_ENV) or 'ssh'
+        for h in hosts:
+            try:
+                subprocess.Popen([ssh, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', h,
+                                  f'/usr/bin/python3 {engine} --touch-notify {root} {sha}'],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError: pass
 
     def notified(self) -> str:
         try: return (self.cache_dir() / NOTIFY_FILE).read_text().strip()
@@ -242,7 +305,7 @@ class Repo:
 
 
 def _selftest() -> int:
-    import json
+    import json, sys
     with tempfile.TemporaryDirectory(prefix='board-transport-') as td:
         base = Path(td); remote = base / 'remote.git'; root = base / 'source'; ws = base / 'cache'
         os.environ['AGENT_BOARD_CACHE_DIR'] = str(ws)
@@ -280,6 +343,29 @@ def _selftest() -> int:
         git(root, 'checkout', '-q', '--', 'board.json')
         assert not r.fast_forward(c3, 'collaborators')                                  # never for a collaborators board
         r.notify(c3); assert r.notified() == c3
+        assert r.fetched_age() < 60                                                          # push stamped the machine
+        # persistent materialisation: built once, hard-linked, reused by path; a second commit gets its own directory
+        d1 = r.materialized(c3); assert (d1 / BASE_FILE).read_text().strip() == c3 and d1 == r.materialized(c3)
+        f = next((d1 / 'events').rglob('*.json')); assert f.stat().st_nlink >= 2, f                # a link, not a copy
+        assert d1.name == 'board' and d1.parent.parent.name == TREE_DIR and r.materialized(c2) != d1
+        # remote notify: the ssh stub records what it was asked to run
+        stub = base / 'ssh'; stub.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$STUB_SSH_OUT"\n'); stub.chmod(0o755)
+        os.environ['STUB_SSH_OUT'] = str(base / 'ssh.out'); os.environ[NOTIFY_SSH_ENV] = str(stub); os.environ[NOTIFY_HOSTS_ENV] = 'host-a'
+        saved_home = os.environ.get('HOME'); os.environ['HOME'] = str(base)      # the fixture's root is then "under home" → ~/source
+        try:
+            r.notify(c3)
+            for _ in range(40):                                                       # the stub runs in the background
+                if (base / 'ssh.out').is_file() and (base / 'ssh.out').read_text().count('\n') >= 6: break
+                time.sleep(0.1)
+            time.sleep(0.2)
+        finally:
+            os.environ['HOME'] = saved_home
+        got = (base / 'ssh.out').read_text().splitlines()
+        assert got[0] == '-o' and got[4] == 'host-a' and got[5].startswith('/usr/bin/python3 ') and got[5].endswith(f'--touch-notify ~/source {c3}'), got
+        os.environ.pop(NOTIFY_HOSTS_ENV); os.environ.pop(NOTIFY_SSH_ENV)
+        # --touch-notify = the remote end of that call
+        subprocess.run([sys.executable, __file__, '--touch-notify', str(root), 'cafe0000'], check=True, env=dict(os.environ))
+        assert r.notified() == 'cafe0000'
         # a board that is a subdirectory of a project: prefix in paths, project checkout never fast-forwarded
         proj = base / 'proj'; subprocess.run(['git', 'init', '-q', '-b', 'main', str(proj)], check=True)
         for k, v in [('user.name', 'Fixture'), ('user.email', 'fixture@example.invalid')]: git(proj, 'config', k, v)
@@ -300,4 +386,7 @@ def _selftest() -> int:
 
 if __name__ == '__main__':
     import sys
-    sys.exit(_selftest() if '--selftest' in sys.argv else 0)
+    if '--selftest' in sys.argv: sys.exit(_selftest())
+    if len(sys.argv) == 4 and sys.argv[1] == '--touch-notify':
+        Repo(os.path.expanduser(sys.argv[2])).notify_local(sys.argv[3]); sys.exit(0)
+    sys.exit(0)

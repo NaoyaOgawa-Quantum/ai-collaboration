@@ -123,9 +123,19 @@ in-progress edits. This is durable delivery on the next check, not unattended di
 separate program with its own execution policy. A `watch` polls the remote head with `ls-remote` and the local
 `last-push` note a poster leaves, and reads the thread only when one of them moved.
 
-**Starting the worker a role names**: the board still starts no agent by itself. A request to a role prints the
-command that opens the worker as a background CLI session with model, effort and config dir pinned, and runs it only
-on `--launch` — the requester's shell is the actor. Measured before: the desktop's chip opened on the parent's model,
+**One round trip, not two**: a post reads the branch head this machine fetched or pushed within the last minute
+without fetching again (the machine's `last-fetch` stamp, shared by its processes; a running `watch` keeps it young)
+and pushes; a rejected push proves the base stale, and only then does it fetch and revalidate. Reads asked for
+explicitly (`--sync`) always fetch. The materialised board of a commit is kept under the cache and hard-linked from
+the blob cache, so the second reader of a commit pays nothing. After a push the poster also touches the `last-push`
+note on the machines named in `AGENT_BOARD_NOTIFY_HOSTS` over ssh (background, fail-silent), so their watches wake
+within seconds rather than at the next remote check. What remains is the SSH handshake itself; an ssh
+`ControlMaster` for the host is the owner's wiring, not the engine's.
+
+**Starting the worker a role names**: the board starts no agent on its own authority. A request to a role prints the
+command that opens the worker as a background CLI session with model, effort and config dir pinned, and runs it on
+`--launch` or when the owner's wiring says every such request should (`AGENT_BOARD_LAUNCH_DEFAULT=1`, opt-out
+`--no-launch`) — the requester's shell is the actor, in the workspace directory. Measured before: the desktop's chip opened on the parent's model,
 the model switch is app-wide, and a hand-off pasted into a window ran on whatever model that window had; the
 hand-off text is therefore passed by file (quoting-free) and names the model too, for windows opened by hand. The
 defaults (account, model, effort) are environment variables set by the owner's wiring, so no personal path lives

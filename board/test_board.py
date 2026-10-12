@@ -871,6 +871,11 @@ class CollaboratorBoards(unittest.TestCase):
         return p
     def eid(self, out): return next(l.split('=',1)[1] for l in out.splitlines() if l.startswith('event_id='))
 
+    def test_stats_smoke(self):
+        b=str(self.proj/'board')
+        self.cli('request','--root',b,'--agent','claude','--session','c-1','--thread','2026-10-05-stats','--to','codex','--to-session','x-1','--summary','s','--acceptance','a')
+        p=subprocess.run([self.sys.executable,str(board.ENGINE/'board-view.py'),'--root',b,'--stats','--sync'],capture_output=True,text=True)
+        self.assertEqual(p.returncode,0,p.stderr); self.assertIn('依頼 1 件',p.stdout); self.assertIn('[引受待ち] proj/2026-10-05-stats',p.stdout)
     def test_discovery_and_resolution(self):
         import board_config as bc
         found={b['name']:b for b in bc.discover(self.ws)}
@@ -1201,13 +1206,63 @@ class LaunchCommandCLI(Transport):
             hp=board.outbox_dir(self.root)/(rid+'.handoff.txt'); self.assertTrue(hp.is_file()); self.assertIn(rid,hp.read_text())
             out2=cli('request',*base,'--thread','r-00112233aabc','--to','claude','--to-session','claude-win-other')
             self.assertNotIn('受け手を起こす',out2)
+            # launch by default (owner wiring): the stub CLI is run unless --no-launch
+            stub=self.base/'claude-stub'; stub.write_text('#!/bin/sh\necho backgrounded deadbeef\n'); stub.chmod(0o755)
+            os.environ['AGENT_BOARD_LAUNCH_DEFAULT']='1'; os.environ['AGENT_BOARD_LAUNCH_CLI']=str(stub)
+            try:
+                out4=cli('request',*base,'--thread','r-00112233aabe','--to','claude','--to-session','role-q-work')
+                self.assertIn('起動した: backgrounded deadbeef',out4)
+                out5=cli('request',*base,'--thread','r-00112233aabf','--to','claude','--to-session','role-q-work','--no-launch')
+                self.assertIn('受け手を起こす',out5); self.assertNotIn('起動した',out5)
+                out6=cli('request',*base,'--thread','r-00112233aac0','--to','claude','--to-session','role-q-work','--preview')
+                self.assertNotIn('起動した',out6)
+            finally:
+                os.environ.pop('AGENT_BOARD_LAUNCH_DEFAULT',None); os.environ.pop('AGENT_BOARD_LAUNCH_CLI',None)
             out3=cli('request',*base,'--thread','r-00112233aabd','--to','claude','--to-session','role-q-work','--preview')
             self.assertIn('受け手を起こす',out3); self.assertIn('--bg --model claude-model-y',out3); self.assertNotIn('起動した',out3)
             self.assertIn('まだ無い session',out3); self.assertNotIn('成り行き (chip の tag は推奨',out3)
-            with board.snapshot(self.root) as snap: self.assertEqual(len([e for e in board.read(snap) if e['kind']=='request']),2)   # preview posted nothing
+            with board.snapshot(self.root,fresh=True) as snap: self.assertEqual(len([e for e in board.read(snap) if e['kind']=='request']),4)   # the two previews posted nothing
         finally:
             if saved is None: os.environ.pop('AGENT_BOARD_LAUNCH_MODEL',None)
             else: os.environ['AGENT_BOARD_LAUNCH_MODEL']=saved
+
+
+class OptimisticPost(Transport):
+    """A post right after this machine fetched or pushed does not fetch again (one round trip saved); when the remote
+    moved meanwhile, the rejected push makes it fetch and revalidate, and a competing claim is still refused."""
+    def _count_fetches(self):
+        import board_transport as bt
+        calls=[]; orig=bt.Repo.fetch
+        def counted(repo): calls.append(1); return orig(repo)
+        bt.Repo.fetch=counted
+        return calls, (lambda: setattr(bt.Repo,'fetch',orig))
+    def test_fresh_machine_posts_without_a_fetch_and_a_moved_remote_still_lands(self):
+        if bt.transport()=='clone': self.skipTest('clone transport always clones')
+        r,c,sub=chain()
+        board.post(self.root,r)                                    # stamps last-fetch via the push
+        calls,restore=self._count_fetches()
+        try:
+            board._FETCHED.clear()
+            board.post(self.root,c)                                # optimistic: no fetch
+            self.assertEqual(calls,[])
+            # the remote moves (a raw commit through the clone transport), then an optimistic post is rejected once and lands
+            note=event('note',5,agent='claude',thread='2026-09-06-other'); note['request_id']=note['event_id']
+            self.import_record(note)
+            board._FETCHED.clear()
+            board.post(self.root,sub)
+            self.assertEqual(len(calls),1)                         # exactly one fetch, after the rejection
+            with board.snapshot(self.root,fresh=True) as snap:
+                es=board.read(snap); self.assertEqual(len(es),4)
+                self.assertEqual(reduce_workflow([e for e in es if e['thread_id']==r['thread_id']],NOW+dt.timedelta(seconds=30))['status'],'submitted')
+        finally: restore()
+    def test_competing_claim_is_refused_even_when_the_first_read_was_optimistic(self):
+        if bt.transport()=='clone': self.skipTest('clone transport always clones')
+        r,c,_=chain(); board.post(self.root,r)
+        competitor=event('claim',2); competitor['actor']['instance']='codex@fixture/competitor'
+        self.import_record(competitor)                             # lands on the remote behind this machine's back
+        board._FETCHED.clear()
+        with self.assertRaisesRegex(ValueError,'live claim'):
+            board.post(self.root,c)                                # optimistic read lacks it; the push is rejected; fresh read refuses
 
 
 class TransportClone(Transport):

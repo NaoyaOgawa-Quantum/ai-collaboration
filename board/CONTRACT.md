@@ -152,8 +152,13 @@ Operating facts (measured):
 - `inbox` without `--session` addresses only the calling session (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`).
   Whose turn it is across all sessions comes from `board-view.py --surface --json` (fast, local).
 - `--sync` fetches the branch and reads it from the repository's object store (one round trip; only events this
-  machine has not decrypted yet are decrypted, once, into `~/.cache/agent-board/`); a post is one fetch and one push.
-  Neither clones the remote. On an owner board whose working tree is clean, a post also fast-forwards the local
+  machine has not decrypted yet are decrypted, once, into `~/.cache/agent-board/`, and the board at each commit is
+  materialised there once from hard links). A post is one push, plus one fetch only when this machine has not
+  fetched or pushed the branch in the last minute (a rejected push fetches and revalidates, so a stale base never
+  lands). Neither clones the remote. With `AGENT_BOARD_NOTIFY_HOSTS=<ssh hosts>` a push also wakes those machines'
+  watches (ssh, background, fail-silent: the host runs `board_transport.py --touch-notify` for the same board path
+  under its home). The round trip itself is mostly the SSH handshake to the host: an ssh `ControlMaster` for it cuts
+  it from about two seconds to under one (measured). On an owner board whose working tree is clean, a post also fast-forwards the local
   checkout, so other sessions on this machine read it without `--sync`; a board inside a shared project never moves
   the project's checkout, so there the working tree is stale right after a post — read back with `--sync`.
   `AGENT_BOARD_TRANSPORT=clone` selects the previous transport (a temporary clone, decrypting every file) for one
@@ -398,7 +403,9 @@ python3 board_items.py list    --root <board>
 - <a id="worker-handoff-text"></a>**Starting the worker a role names**: a `request --to claude --to-session role-…`
   writes the hand-off text to the outbox (`<request id>.handoff.txt`) and prints one shell line that opens the worker
   as a background CLI session with its model, reasoning effort and config dir pinned —
-  `CLAUDE_CONFIG_DIR=<dir> claude --bg --model <m> --effort <e> "$(cat <file>)"` — and `--launch` runs it at once.
+  `CLAUDE_CONFIG_DIR=<dir> claude --bg --model <m> --effort <e> "$(cat <file>)"` — and `--launch` runs it at once
+  (with `AGENT_BOARD_LAUNCH_DEFAULT=1` in the owner's wiring every such request runs it, `--no-launch` keeps it to
+  the printed line; `--preview` never runs it). The worker starts in the workspace directory.
   Model = `--expect-model`, else `AGENT_BOARD_LAUNCH_MODEL`, else the requester's own model; effort =
   `AGENT_BOARD_LAUNCH_EFFORT`, else the requester's `CLAUDE_EFFORT`; config dir = `AGENT_BOARD_LAUNCH_CONFIG_DIR`
   (the owner's wiring names a logged-in account: measured, a machine's default config dir was not logged in and the
@@ -443,6 +450,7 @@ python3 board.py inbox --board <name> --agent codex --sync   # latest addressed 
 python3 board-view.py --board <name> --sync --surface    # all actionable work
 python3 board-view.py --all-boards --surface --json      # dashboards: every board, threads tagged with `board`
 python3 board-view.py --board <name> --validate          # schema + protocol + paths
+python3 board-view.py --board <name> --stats --sync   # dwell per transition (median / p90 / max) and open requests, oldest first
 python3 board-html.py --board <name> --sync --open       # static snapshot (~/.cache/agent-board/<name>.html)
 python3 board-serve.py --board <name>                    # localhost live view; reload synchronises
 python3 board-view.py --selftest && python3 board-session-start.py --selftest && python3 test_board.py && python3 board_items.py --selftest
