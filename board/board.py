@@ -958,11 +958,13 @@ def main():
         # Default transport: between reads, the remote's branch head is asked with `ls-remote` (one round trip, no
         # transfer) every --interval seconds, and the local `last-push` note of this machine's posters every
         # NOTIFY_POLL_S; the thread is read again only when either moved. The clone transport reads every interval.
-        repo=bt.Repo(a.root) if bt.transport()!='clone' else None; last_remote=last_note=None
+        repo=bt.Repo(a.root) if bt.transport()!='clone' else None; last_remote=last_note=None; next_remote=0.0
         while True:
             try:
                 if repo is not None and key is not None:
-                    remote,note=repo.ls_remote(),repo.notified()
+                    # the remote is asked once per --interval (one SSH round trip); the local note every NOTIFY_POLL_S
+                    note=repo.notified(); remote=last_remote
+                    if time.time()>=next_remote: remote=repo.ls_remote(); next_remote=time.time()+a.interval
                     if (remote,note)==(last_remote,last_note):
                         if time.time()+NOTIFY_POLL_S>deadline: print('watch: 新しい書き込みなし (時間切れ)'); sys.exit(3)
                         time.sleep(NOTIFY_POLL_S); continue
@@ -974,7 +976,7 @@ def main():
                                if (t.get('workflow') or {}).get('request_id')==a.request]
                         if len(found)!=1: raise ValueError('request not found or ambiguous: '+a.request)
                         key=found[0]
-                        if repo is not None: last_remote,last_note=repo.remote_sha(),repo.notified()
+                        if repo is not None: last_remote,last_note=repo.remote_sha(),repo.notified(); next_remote=time.time()+a.interval
                     thread=[e for e in events if (e['project']['key'],e['thread_id'])==key]
             except Exception as ex:  # noqa: BLE001  only sync failures are retried, see transient_sync_error
                 if not transient_sync_error(ex): raise
@@ -994,11 +996,7 @@ def main():
             seen.update(ids)
             if time.time()+a.interval>deadline: print('watch: 新しい書き込みなし (時間切れ)'); sys.exit(3)
             if repo is None: time.sleep(a.interval); continue
-            # wait out the interval, waking early when a poster on this machine notes a push
-            end=time.time()+a.interval
-            while time.time()<end:
-                time.sleep(min(NOTIFY_POLL_S,max(0.0,end-time.time())))
-                if repo.notified()!=last_note: break
+            next_remote=time.time()+a.interval   # just read: the next remote check is a full interval away; the note is polled meanwhile
     if a.command=='sessions':
         with snapshot(a.root) if a.sync else contextlib.nullcontext(a.root) as root:
             events=read(root)
