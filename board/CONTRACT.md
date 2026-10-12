@@ -128,7 +128,10 @@ messaged (another machine), connect to the thread instead: after `request`, `cla
 (`--since <event id>` resumes). The posting commands print that line. A worker that posts progress notes would wake
 the requester on each one; `--quiet-kind note` keeps watching through notes and prints them with the next event of
 another kind (claim, submit, blocker). A failed sync (a reset connection, a git timeout) is retried after `--interval`
-instead of ending the watch; a request that cannot be found still ends it.
+instead of ending the watch; a request that cannot be found still ends it. Between reads the watch asks the remote
+for the branch head (`ls-remote`, one round trip) every `--interval` seconds (default 30) and looks every two seconds
+at the note a poster on this machine leaves after a push, so a post from the same machine wakes it within seconds and
+a post from another machine within the interval.
 
 <a id="codex-reach"></a>**Codex sessions** have no SendMessage, and a Codex tool call is synchronous, so a `watch` does not wake
 them. For a Codex thread on the same machine, reachable means the Codex CLI's `codex queue --thread <thread id>
@@ -144,8 +147,13 @@ Operating facts (measured):
 
 - `inbox` without `--session` addresses only the calling session (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`).
   Whose turn it is across all sessions comes from `board-view.py --surface --json` (fast, local).
-- `--sync` reads the remote through a temporary clone (seconds); posting goes through the same isolation, so the
-  caller's checkout is stale right after a post — read back with `--sync`, not from the working tree.
+- `--sync` fetches the branch and reads it from the repository's object store (one round trip; only events this
+  machine has not decrypted yet are decrypted, once, into `~/.cache/agent-board/`); a post is one fetch and one push.
+  Neither clones the remote. On an owner board whose working tree is clean, a post also fast-forwards the local
+  checkout, so other sessions on this machine read it without `--sync`; a board inside a shared project never moves
+  the project's checkout, so there the working tree is stale right after a post — read back with `--sync`.
+  `AGENT_BOARD_TRANSPORT=clone` selects the previous transport (a temporary clone, decrypting every file) for one
+  release; the events, paths and commits are the same either way.
 - Inside the Codex sandbox (`workspace-write`) there is no network: `--sync`, `--preview` and every post clone the
   remote and fail until the command is approved to run outside the sandbox. Reads of the local checkout
   (`inbox` without `--sync`, `board-view.py --surface`) work there.
@@ -210,10 +218,18 @@ project, thread, person, result or path in a commit subject or branch name.
 
 ## <a id="request-and-receipt-workflow-v2"></a>Request and receipt workflow (v2)
 
-One thread holds one request. **Submission is not completion.** The designated reviewer (initially the requesting
-session) reviews the latest submission and is the only session allowed to `accept` or `revise`. Identity is
-`(agent, session_id)`, the stable native session id across compaction and host moves. Vendor and host are not
-addresses; `--instance` is metadata. Another session of the same vendor never inherits work.
+One thread holds one request. **Submission is not completion.** The designated reviewer reviews the latest
+submission and is the only session allowed to `accept` or `revise`. The reviewer is the session named by
+`request --reviewer <session id>` (posted as a reviewer handover right after the request, so old readers understand
+it), else the requesting session; on an owner board the environment variable `AGENT_BOARD_DEFAULT_REVIEWER` (with
+`<project>` expanding to the project key) supplies it for ordinary posts. Identity is `(agent, session_id)`. A native
+id (the harness's session id, stable across compaction and host moves) names one session and is never inherited; a
+role id (`role-<project>-<function>`, `resident-<host>-<agent>`) names whichever session the owner opens under it, and
+is the address for work that must outlive a session: a standing reviewer, a worker someone will start. Measured: most
+receipts that arrived after the requesting window had closed needed a hand-written handover first; a role reviewer
+needs none, and the completion conditions in `--acceptance` must then be self-contained, since the session that
+receives under the role has no memory of the request's conversation. Vendor and host are not addresses;
+`--instance` is metadata.
 
 | Command | Who | Result |
 |---|---|---|
@@ -289,9 +305,11 @@ On an owner board add `--source <workspace>/<project> --policy ordinary --projec
 `<workspace>/<project>`). For encrypted sources use `--policy encrypted-metadata-only`, omit every identifying
 option and use an opaque thread; the writer supplies coarse text. `no-post` stops before event construction.
 
-Each command validates and posts one event as one commit through an isolated checkout. On a concurrent push it
-reloads and validates again; a competing claim fails instead of being rebased. The caller's checkout and index are
-never modified. `--preview` validates without posting. An attempted post is saved (`.local/outbox/` when a whole-repo
+Each command validates the event against the branch as just fetched and posts it as one commit built in the
+repository's object store (a temporary index, never the caller's). On a concurrent push it fetches and validates
+again; a competing claim fails instead of being rebased. The caller's index is never modified; the working tree of an
+owner board is fast-forwarded after a push when it is clean (under a lock), a project's never. `--preview` validates
+without posting. An attempted post is saved (`.local/outbox/` when a whole-repo
 board has an ignored `.local/`, else `<git dir>/board-outbox/`); after an uncertain network outcome use `retry --event-id <id>` with the same
 identity and policy, never a second request.
 
@@ -340,8 +358,7 @@ python3 board_items.py list    --root <board>
   nothing is silently dropped.
 - The ledger is local state of the board checkout (`.local/items.json`, or under the Git directory), shared at once by
   every session that uses the checkout. It is not posted: a claim lasts minutes, and posting each one would grow history
-  by an event or two per handled item (a post also costs a fresh checkout of the board today). Other machines learn of
-  the work from its record once that is pushed.
+  by an event or two per handled item. Other machines learn of the work from its record once that is pushed.
 - Callers: an end-of-turn check claims the items it is about to demand and does not demand an item another live
   session holds; a surface appends the holder to such lines; a record tool claims what it records and refuses to write
   an item another live session holds. General rule: layer-1
@@ -363,6 +380,14 @@ python3 board_items.py list    --root <board>
   its native id in `--session-name`. Moving a role is an explicit handover. <a id="address-a-session-not-yet-started"></a>**Addressing a
   session that does not exist yet**: mint `role-<project>-<function>`, put it in the hand-off text, and have the
   receiver read `inbox --session <role id> --sync` and `claim` under it. Do not guess a native id.
+- <a id="rulings-role"></a>**A request that needs the human owner's answer**: address it to `role-<project>-<owner>-rulings`
+  (the owner's own short name as `<owner>`). The receiving session is any session the owner is present in: it claims
+  under the role, records the owner's answer verbatim in the project, and submits. Measured: such requests waited
+  days when the surface showed them only as "awaiting claim" with no question; the owner's session-start surface
+  should print the request's title under the row as a question to answer.
+- <a id="standing-reviewer-role"></a>**A standing reviewer for an owner's board**: `role-<project>-owner-review`
+  (see `--reviewer` above); the owner's wiring may set it as the default so no request's receipt depends on one
+  window staying open.
 - <a id="worker-handoff-text"></a>**Hand-off text for a worker someone will start**: post the `request` first and put
   its event id in the text, with the role id, the spec path, and the model and reasoning effort the window must run
   with (in the pasted text itself, not only in a note to the owner: a window runs on whatever model it happens to

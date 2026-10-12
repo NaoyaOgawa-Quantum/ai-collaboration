@@ -85,11 +85,14 @@ def hook_output(text: str | None, error: str | None) -> dict | None:
                 "掲示板の読み書きが要るときは、 人に command を渡さず board.py で代わりに行う。")}}
 
 
-def run_view(workspace, sync: bool, timeout: float) -> str:
-    cmd = [sys.executable, str(ENGINE / "board-view.py"), "--all-boards", "--surface"]
+def run_view(workspace, sync: bool, timeout: float, root=None) -> str:
+    """The surface text of every board in the workspace, or of one board (`root`: a collaborator's project hook reads
+    only that project's board, whose readers are the project's members)."""
+    cmd = [sys.executable, str(ENGINE / "board-view.py"), "--surface"]
+    cmd += ["--root", str(root)] if root else ["--all-boards"]
     if sync:
         cmd.append("--sync")
-    if workspace:
+    if workspace and not root:
         cmd += ["--workspace", str(workspace)]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
@@ -201,21 +204,26 @@ def main(argv=None) -> int:
     ap.add_argument("--workspace", type=Path, help="checkout を並べた directory (既定: AGENT_BOARD_WORKSPACE、 無ければ engine の親)")
     ap.add_argument("--no-sync", action="store_true", help="remote でなく手元の checkout を読む")
     ap.add_argument("--timeout", type=float, default=25.0, help="board-view.py の上限秒 (hook の timeout より短く)")
+    ap.add_argument("--root", type=Path, help="1 枚の掲示板だけ (共同研究の project の hook が自分の board/ を読む)")
+    ap.add_argument("--plain", action="store_true", help="hook の JSON でなく、 他の hook の出力に埋め込める text を出す (要注意 thread が無ければ無出力)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
     if a.selftest:
         return _selftest()
     if os.environ.get("AGENT_BOARD_SESSION_START", "1") == "0":
         return 0
-    payload = read_payload(sys.stdin)
+    payload = {} if a.plain else read_payload(sys.stdin)
     if in_sealed_sandbox(payload.get("cwd") or os.getcwd()):
         return 0
     try:
-        text, error = run_view(a.workspace, not a.no_sync, a.timeout), None
+        text, error = run_view(a.workspace, not a.no_sync, a.timeout, root=a.root), None
     except (OSError, subprocess.SubprocessError, RuntimeError) as ex:
         text, error = None, str(ex)
     out = hook_output(text, error)
-    if out:
+    if out and a.plain:
+        print(out["systemMessage"] + " — " + RECORD_NOT_INSTRUCTION + ":")
+        print((text or f"確認に失敗: {error}").rstrip())
+    elif out:
         print(json.dumps(out, ensure_ascii=False))
     return 0
 

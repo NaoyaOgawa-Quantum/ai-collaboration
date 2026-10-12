@@ -21,7 +21,9 @@ board/
   board_workflow.py  # the v2 request/receipt reducer (single state authority)
   board_schema.py    # dependency-free strict schema validator
   board_config.py    # board.json, board selection, discovery, reader gate, scaffold
+  board_transport.py # one fetch, one push: read and write through the object store, decrypt each event once per machine
   board_items.py     # item claims among parallel sessions on one machine (checkout-local ledger, not posted)
+  board-post-reach-check.py  # Stop hook: a post whose next actor is reachable was followed by a direct message
   schema/event.schema.json
   test_board.py      # behaviour, encrypted transport, races, collaborator boards
 ```

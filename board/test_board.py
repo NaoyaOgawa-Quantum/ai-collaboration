@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 import board
+import board_transport as bt
 from board_workflow import reduce_workflow, COARSE
 from board_schema import errors, check_schema, history_errors
 
@@ -713,8 +714,9 @@ class Transport(unittest.TestCase):
         with board.snapshot(self.root) as snap:
             es=board.read(snap); self.assertEqual(len(es),4)
             self.assertEqual(reduce_workflow(es,NOW+dt.timedelta(seconds=30))['status'],'accepted')
+            board.run(self.root,'fetch','-q','origin','main')
             for e in es:
-                blob=board.run(snap,'show','HEAD:'+str(e['_path'].relative_to(snap))).stdout
+                blob=board.run(self.root,'cat-file','blob','origin/main:'+str(e['_path'].relative_to(snap))).stdout
                 self.assertTrue(blob.startswith(board.view.GITCRYPT_MAGIC))
     def test_concurrent_claim_loser_revalidates(self):
         r,c,_=chain(); board.post(self.root,r)
@@ -786,8 +788,8 @@ class Transport(unittest.TestCase):
             self.assertEqual(state['answer']['event_id'],answer['event_id'])
 
     def import_record(self, e, *, corrupt_json=False):
-        """Simulate already-published malformed history through encrypted Git."""
-        with board.snapshot(self.root) as root:
+        """Simulate already-published malformed history through encrypted Git (a raw git write = the clone transport)."""
+        with board.snapshot_clone(self.root) as root:
             p = root / 'events' / e['project']['key'] / e['thread_id'] / (board.view.compact(
                 board.view.parse_ts(e['created_at'])) + '--' + e['event_id'] + '.json')
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -881,15 +883,18 @@ class CollaboratorBoards(unittest.TestCase):
             '--summary','done','--deliverable','notes/a.md').stdout)
         self.cli('accept','--root',b,'--agent','claude','--session','c-1','--request',req,'--reply-to',sub,
             '--summary','checked','--reference','proj@'+board.run(self.proj,'rev-parse','HEAD').stdout.decode().strip()[:10])
+        head_before=board.run(self.proj,'rev-parse','HEAD').stdout
         with board.snapshot(self.proj/'board') as snap:
             self.assertEqual(snap.name,'board')
             es=board.read(snap); self.assertEqual(len(es),4)
             self.assertEqual(reduce_workflow(es,NOW+dt.timedelta(minutes=5))['status'],'accepted')
-            names=board.run(snap,'log','--name-only','--format=','HEAD').stdout.decode().split()
-            posted=[n for n in names if '/events/' in '/'+n]
-            self.assertEqual(len(posted),4); self.assertTrue(all(n.startswith('board/events/proj/2026-10-05-check/') for n in posted))
-            self.assertFalse((snap.parent/'notes').exists())         # sparse: only the board is checked out
-        # the caller's checkout was not touched; its pull brings the events
+        board.run(self.proj,'fetch','-q','origin','main')
+        names=board.run(self.proj,'log','--name-only','--format=','origin/main').stdout.decode().split()
+        posted=[n for n in names if '/events/' in '/'+n]
+        self.assertEqual(len(posted),4); self.assertTrue(all(n.startswith('board/events/proj/2026-10-05-check/') for n in posted))
+        # the caller's checkout was not touched (a project checkout is never fast-forwarded); its pull brings the events
+        self.assertEqual(board.run(self.proj,'rev-parse','HEAD').stdout,head_before)
+        self.assertFalse((self.proj/'board'/'events').exists())
         board.run(self.proj,'pull','-q','origin','main')
         out=self.cli('show','--root',b,'--agent','claude','--session','c-1','--request',req,'--json').stdout
         self.assertEqual(json.loads(out)['status'],'accepted')
@@ -1055,6 +1060,112 @@ class Watch(unittest.TestCase):
         self.assertTrue(board.transient_sync_error(subprocess.TimeoutExpired('git',1)))
         self.assertFalse(board.transient_sync_error(ValueError('request not found or ambiguous: x')))
         self.assertFalse(board.transient_sync_error(KeyError('event_id')))
+
+
+class FetchTransport(Transport):
+    """What the default (fetch) transport adds: the checkout moves after a post, old and new transports read one
+    history, a reviewer role outlives the requesting session, and watch wakes on a post. Runs on the Transport fixture."""
+    def _env(self, **kv):
+        import os
+        saved={k:os.environ.get(k) for k in kv}
+        for k,v in kv.items():
+            if v is None: os.environ.pop(k,None)
+            else: os.environ[k]=v
+        def restore():
+            for k,v in saved.items():
+                if v is None: os.environ.pop(k,None)
+                else: os.environ[k]=v
+        return restore
+    def test_clean_owner_checkout_moves_after_a_post_and_a_dirty_one_stays(self):
+        if bt.transport()=='clone': self.skipTest('clone transport never moves the checkout')
+        r,c,sub=chain()
+        board.post(self.root,r)
+        board.run(self.root,'fetch','-q','origin','main')
+        self.assertEqual(board.run(self.root,'rev-parse','HEAD').stdout,board.run(self.root,'rev-parse','origin/main').stdout)
+        f=self.root/'events'/'example'/r['thread_id']
+        self.assertEqual(len(list(f.glob('*.json'))),1)
+        self.assertEqual(json.loads(next(f.glob('*.json')).read_text())['event_id'],r['event_id'])   # decrypted by the checkout's filter
+        (self.root/'board.json').write_text((self.root/'board.json').read_text()+'\n')              # a tracked file edited = not clean
+        board.post(self.root,c)
+        board.run(self.root,'fetch','-q','origin','main')
+        self.assertNotEqual(board.run(self.root,'rev-parse','HEAD').stdout,board.run(self.root,'rev-parse','origin/main').stdout)
+        self.assertEqual(len(list(f.glob('*.json'))),1)
+        board.run(self.root,'checkout','-q','--','board.json')
+        board.post(self.root,sub)                                                                  # clean again: moves
+        self.assertEqual(len(list(f.glob('*.json'))),3)
+    def test_both_transports_read_one_history_in_one_order(self):
+        r,c,sub=chain()
+        restore=self._env(AGENT_BOARD_TRANSPORT=None)
+        try:
+            board.post(self.root,r)
+            restore2=self._env(AGENT_BOARD_TRANSPORT='clone'); board.post(self.root,c); restore2()
+            board.post(self.root,sub)
+            with board.snapshot_clone(self.root) as a, board.snapshot(self.root) as b:
+                ea,eb=board.read(a),board.read(b)
+                self.assertEqual([e['event_id'] for e in ea],[e['event_id'] for e in eb])
+                self.assertEqual([e['_commit']['sha'] for e in ea],[e['_commit']['sha'] for e in eb])
+                self.assertEqual(reduce_workflow(eb,NOW+dt.timedelta(seconds=30))['status'],'submitted')
+                self.assertEqual(board.view.to_json_payload(b,board.view.derive(eb,NOW),[],now=NOW,locked=False)['head'],
+                                 board.run(self.root,'rev-parse','--short','origin/main').stdout.decode().strip()[:7])
+        finally: restore()
+    def test_reviewer_role_receives_the_submission_and_may_accept(self):
+        import sys
+        script=board.ENGINE/'board.py'
+        def cli(kind, agent, session, *args, ok=True):
+            cmd=[sys.executable,str(script),kind,'--root',str(self.root),'--agent',agent,'--session',session]
+            if kind!='inbox': cmd += ['--source',str(self.root),'--policy','encrypted-metadata-only']
+            p=subprocess.run(cmd+list(args),capture_output=True,text=True)
+            if ok: self.assertEqual(p.returncode,0,p.stderr)
+            return p
+        def eids(output): return [l.split('=',1)[1] for l in output.splitlines() if l.startswith('event_id=')]
+        out=cli('request','claude','claude-win-1','--thread','r-0a1b2c3d4e5f','--to','codex','--to-session','codex-cli-1','--reviewer','role-x-owner-review').stdout
+        req,=eids(out); self.assertIn('検収役 = claude/role-x-owner-review',out)
+        claim,=eids(cli('claim','codex','codex-cli-1','--request',req).stdout)
+        sub,=eids(cli('submit','codex','codex-cli-1','--request',req,'--reply-to',claim).stdout)
+        self.assertIn('確認待ち',cli('inbox','claude','role-x-owner-review','--sync').stdout)       # the role's inbox, not the window's
+        self.assertIn('対応待ちはありません',cli('inbox','claude','claude-win-1','--sync').stdout)
+        p=cli('accept','claude','claude-win-1','--request',req,'--reply-to',sub,ok=False)
+        self.assertNotEqual(p.returncode,0); self.assertIn('designated reviewer',p.stderr)
+        cli('accept','claude','role-x-owner-review','--request',req,'--reply-to',sub,'--session-name','01234567 (fixture)')
+        self.assertIn('対応待ちはありません',cli('inbox','claude','role-x-owner-review','--sync').stdout)
+        # reviewer = assignee is refused before anything is posted
+        p=cli('request','claude','claude-win-2','--thread','r-0a1b2c3d4e60','--to','codex','--to-session','codex-cli-2','--reviewer','codex-cli-2',ok=False)
+        self.assertNotEqual(p.returncode,0); self.assertIn('differ',p.stderr)
+    def test_watch_wakes_on_the_other_side_s_post(self):
+        import sys, time
+        r,c,_=chain(); board.post(self.root,r)
+        w=subprocess.Popen([sys.executable,str(board.ENGINE/'board.py'),'watch','--root',str(self.root),'--agent','claude',
+                            '--session','claude-session-001','--request',r['event_id'],'--interval','1','--max-minutes','1'],
+                           stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        time.sleep(2); board.post(self.root,c)
+        out,err=w.communicate(timeout=60)
+        self.assertEqual(w.returncode,0,err); self.assertIn('claim',out); self.assertIn(c['event_id'][:10],out)
+
+
+class TransportClone(Transport):
+    """The previous transport (AGENT_BOARD_TRANSPORT=clone) still passes the transport tests."""
+    def setUp(self):
+        import os
+        self._saved=os.environ.get('AGENT_BOARD_TRANSPORT'); os.environ['AGENT_BOARD_TRANSPORT']='clone'
+        super().setUp()
+    def tearDown(self):
+        import os
+        super().tearDown()
+        if self._saved is None: os.environ.pop('AGENT_BOARD_TRANSPORT',None)
+        else: os.environ['AGENT_BOARD_TRANSPORT']=self._saved
+
+
+class CollaboratorBoardsClone(CollaboratorBoards):
+    """A board inside a project through the previous transport."""
+    def setUp(self):
+        import os
+        self._saved=os.environ.get('AGENT_BOARD_TRANSPORT'); os.environ['AGENT_BOARD_TRANSPORT']='clone'
+        super().setUp()
+    def tearDown(self):
+        import os
+        super().tearDown()
+        if self._saved is None: os.environ.pop('AGENT_BOARD_TRANSPORT',None)
+        else: os.environ['AGENT_BOARD_TRANSPORT']=self._saved
 
 
 if __name__=='__main__': unittest.main()

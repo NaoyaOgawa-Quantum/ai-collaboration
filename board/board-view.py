@@ -55,6 +55,7 @@ from pathlib import Path
 from board_workflow import reduce_workflow, LABELS
 from board_schema import check_schema, errors as schema_errors, history_errors
 import board_config as bc
+import board_transport as bt
 
 ENGINE = Path(__file__).resolve().parent
 SCHEMA_PATH = ENGINE / "schema" / "event.schema.json"
@@ -101,8 +102,29 @@ def git(root: Path, *args: str) -> str:
 COMMIT_META: dict[Path, dict] = {}   # path -> {sha, date, author} (transport info、 表示用)
 
 
+def _head(root: Path) -> str:
+    """The commit a view was read from: the checkout's HEAD, or the fetched commit of a materialised board."""
+    try:
+        return (root / bt.BASE_FILE).read_text(encoding="utf-8").strip()[:7]
+    except OSError:
+        return git(root, "rev-parse", "--short", "HEAD").strip()
+
+
 def event_paths(root: Path) -> list[tuple[Path, bool]]:
     """(path, committed) を main 上の追加順で返す。 未 commit は末尾。"""
+    order = root / bt.ORDER_FILE
+    if order.is_file():
+        # a board materialised by board_transport (a synchronized read): no .git here, the branch order and the
+        # commit meta were computed from the fetched commit. A path the log added but the tree lacks is listed
+        # and fails to open below = damaged history, as with a checkout.
+        out: list[tuple[Path, bool]] = []
+        for line in order.read_text(encoding="utf-8").splitlines():
+            sha, date, author, rel = (line.split("|", 3) + ["", "", "", ""])[:4]
+            if not rel: continue
+            p = root / rel
+            if sha: COMMIT_META[p] = {"sha": sha, "date": date, "author": author}
+            out.append((p, True))
+        return out
     seen: list[Path] = []
     # git prints paths from the repository top; a board in `<repo>/board/` strips that prefix
     prefix = git(root, "rev-parse", "--show-prefix").strip()
@@ -260,7 +282,7 @@ def to_json_payload(root: Path, threads: dict, invalid, *, now: dt.datetime, loc
         "generated_at": iso_z(now),
         "host": socket.gethostname().split(".")[0],
         "root": str(root).replace(str(Path.home()), "~"),
-        "head": git(root, "rev-parse", "--short", "HEAD").strip(),
+        "head": _head(root),
         "locked": locked,
         "invalid": [{"path": str(p.relative_to(root)), "why": why} for p, why in invalid],
         "warnings": [{"path": str(p.relative_to(root)), "why": why} for p, why in warnings],

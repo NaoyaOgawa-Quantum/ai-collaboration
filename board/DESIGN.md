@@ -40,9 +40,9 @@ companion repository with the same members is the alternative when the project's
 commits. Both are the same engine: a board is "a directory with board.json in some repository", and the writer
 handles the subdirectory case.
 
-**Large project repositories**: posting clones the remote into a temporary directory. For a subdirectory board the
-clone is partial (`--filter=blob:none`, commits and trees only) with a sparse checkout of the board, so the cost does
-not grow with the project's data; a remote that does not support filters still works with a full clone.
+**Large project repositories**: posting fetches the project's branch into the collaborator's own checkout and reads
+and writes the board through its object store, so the cost does not grow with the project's data (the clone
+transport, kept for one release, used a partial clone with a sparse checkout of the board for the same reason).
 
 **Reader gate**: a collaborator board refuses, before anything is built, restricted and no-post policies, projects
 outside `sources`, and paths, `<checkout>@<commit>` references, GitHub URLs and summary tokens that name checkouts the
@@ -90,18 +90,38 @@ worker's inbox.
 
 ## Concurrency and delivery
 
-Each post clones the remote into a private temporary checkout, reuses the board's git-crypt capability when it has
-one, validates, commits one event, checks that the blob is ciphertext when the board is encrypted, and pushes. It
-never touches the caller's index or working tree. If another writer wins, only the disposable checkout is reset and
-the transition is revalidated against the new state (at most three attempts); a competing live claim is rejected.
-An exact event is kept locally for idempotent recovery after an ambiguous network outcome.
+Each post fetches the board's branch, validates the transition against the fetched tree, stores the event as a blob
+through the path's clean filter (git-crypt encrypts it; the committed blob is checked to be ciphertext on an
+encrypted board), builds one commit on top of the fetched commit in a temporary index, and pushes it
+(`board_transport.py`). If another writer wins, the push is rejected, the branch is fetched again and the transition
+is revalidated against the new state (at most three attempts); a competing live claim is rejected. An exact event is
+kept locally for idempotent recovery after an ambiguous network outcome.
+
+**Why not a temporary clone any more** (measured on a board of ~1000 events): the first transport cloned the
+remote and ran `git-crypt unlock` over every tracked file, one process per file at 24 ms each, twice per post —
+a minute per post, a second more every day, and a `watch` that spent a quarter of its time cloning. The cost was the
+re-decryption, not Git: a fetch is one round trip and the object store already holds the history. So a synchronized
+read lists the fetched tree, decrypts only the blobs this machine has not seen (`git cat-file --filters`, cached by
+blob id under `~/.cache/agent-board/`: ciphertext is content-addressed, so the cache cannot go stale) and writes
+them as plain files into a temporary board directory that carries the branch order (`.order`) in place of a `.git`.
+The event files, their paths and the commit shape did not change, so boards written by either transport are read by
+the other; the clone transport stays selectable (`AGENT_BOARD_TRANSPORT=clone`) for one release. Rejected: pruning
+or archiving old events (the rule that events are never moved, and readers of two places); a per-thread checkout
+(the duplicate-id check and the surface read the whole board).
+
+**The caller's checkout**: the index is never used (a temporary index file builds the commit). The working tree of
+an owner board that is a whole repository is fast-forwarded after a push when its HEAD is an ancestor of the pushed
+commit and its tracked files are clean — the check and the merge under one lock, since a parallel session may edit
+between them — so sessions on one machine read each other's posts from the checkout without a sync. A board inside a
+shared project never moves the project's checkout: the collaborators' working trees are theirs.
 
 Read availability and write validity are separate: one damaged thread must not disable unrelated requests, and
 dropping a bad record must not turn a damaged thread into an apparently completed one.
 
-`--sync` reads remote state through the same isolated checkout, so another machine's post can be read without
-pulling over in-progress edits. This is durable delivery on the next check, not unattended dispatch; a resident
-runner is a separate program with its own execution policy.
+`--sync` reads remote state through the same fetch, so another machine's post can be read without pulling over
+in-progress edits. This is durable delivery on the next check, not unattended dispatch; a resident runner is a
+separate program with its own execution policy. A `watch` polls the remote head with `ls-remote` and the local
+`last-push` note a poster leaves, and reads the thread only when one of them moved.
 
 ## <a id="path-touches"></a>Path touches
 

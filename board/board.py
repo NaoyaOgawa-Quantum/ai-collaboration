@@ -15,6 +15,7 @@ import tempfile
 import time
 from board_workflow import KINDS, COARSE, LABELS, reduce_workflow
 import board_config as bc
+import board_transport as bt
 
 ENGINE=Path(__file__).resolve().parent
 SCHEMA_PATH=ENGINE/'schema/event.schema.json'
@@ -23,6 +24,8 @@ view=importlib.util.module_from_spec(spec); spec.loader.exec_module(view)
 
 
 GIT_TIMEOUT=int(os.environ.get('AGENT_BOARD_GIT_TIMEOUT','120'))  # seconds per git call (clone/push of the temporary checkout)
+NOTIFY_POLL_S=2     # watch: how often the local last-push note is looked at between remote checks
+DEFAULT_REVIEWER_ENV='AGENT_BOARD_DEFAULT_REVIEWER'   # request: reviewer session id when --reviewer is absent; <project> expands
 
 
 def run(root, *args, check=True):
@@ -164,13 +167,49 @@ def board_branch(root):
     except ValueError: return 'main'
 
 
+FRESH_S=10          # a fetch this young is reused by the same process (the post right after the event was built)
+_FETCHED={}         # str(root) -> (commit, time.time()) of the last fetch in this process
+_REUSED=False       # whether the last snapshot() reused such a fetch (a transition refused on a reused read is retried fresh)
+
+
 @contextlib.contextmanager
-def snapshot(root):
-    """Clone the board's remote into a private temporary directory and yield the board directory inside it.
+def snapshot(root, fresh=False):
+    """The board as the remote holds it now, as a temporary board directory (board.json + events/) that `read` reads.
+
+    Default transport (board_transport): one `git fetch`, then the fetched tree is written out as plain files, each
+    event decrypted once per machine and cached by blob id — seconds, independent of the board's size. `fresh=True`
+    forces a new fetch (a rejected push); otherwise a fetch younger than FRESH_S in this process is reused.
+    `AGENT_BOARD_TRANSPORT=clone` keeps the previous transport (snapshot_clone) for one release.
+    Neither transport touches the caller's index or working tree while reading.
+    """
+    if bt.transport()=='clone':
+        with snapshot_clone(root) as dest: yield dest
+        return
+    if bc.is_locked(root): raise ValueError('board is encrypted and locked (unlock the repository before synchronized reads and posts)')
+    repo=bt.Repo(root); key=str(Path(root).resolve())
+    sha,at=_FETCHED.get(key,('',0.0))
+    global _REUSED
+    _REUSED=not (fresh or not sha or time.time()-at>FRESH_S)
+    if not _REUSED:
+        sha=repo.fetch(); _FETCHED[key]=(sha,time.time())
+    if not sha: raise ValueError(f'the remote has no branch {repo.branch} yet: push the board before synchronized posting')
+    with tempfile.TemporaryDirectory(prefix='agent-board-') as td:
+        yield repo.materialize(sha,Path(td)/'board')
+
+
+def fetched(root, sha):
+    """Record that the remote is known to be at `sha` (after this process pushed it)."""
+    _FETCHED[str(Path(root).resolve())]=(sha,time.time())
+
+
+@contextlib.contextmanager
+def snapshot_clone(root):
+    """Previous transport: clone the board's remote into a private temporary directory and yield the board directory.
 
     Never touches the caller's index or working tree. A board that is a subdirectory of a project repository
     (`<project>/board/`) is cloned partially (no file contents) with only that subdirectory checked out, so a
-    large project costs commits and trees, not its files.
+    large project costs commits and trees, not its files. Cost: the clone plus a `git-crypt unlock` of every file
+    (measured 24 ms per file), which is why board_transport replaced it.
     """
     remote=run(root,'remote','get-url','origin').stdout.decode().strip()
     common=Path(run(root,'rev-parse','--path-format=absolute','--git-common-dir').stdout.decode().strip())
@@ -299,15 +338,78 @@ def post(root, event, *, before_push=None, landed=None):
         if not re.fullmatch(r'r-[a-f0-9]{10,}',event['thread_id']):
             raise ValueError('restricted thread requires opaque r-<10+ hex> identifier')
     rel=Path('events')/event['project']['key']/event['thread_id']/(view.compact(view.parse_ts(event['created_at']))+'--'+event['event_id']+'.json')
-    with snapshot(root) as dest:
+    if bt.transport()=='clone': return _post_clone(root,event,rel,before_push=before_push,landed=landed)
+    return _post_fetch(root,event,rel,before_push=before_push,landed=landed)
+
+
+def _validate_post(dest, event, cfg):
+    """The transition check both transports run against the board as just read; returns (events, same-thread events,
+    existing identical event or None)."""
+    if cfg['audience']=='collaborators' and event['source_policy']!='ordinary':
+        raise ValueError('a collaborators board takes ordinary posts only')
+    if cfg['audience']=='collaborators' and event['project']['key'] not in cfg['sources']:
+        raise ValueError(f"project {event['project']['key']} is not a source of this board")
+    events=read(dest)
+    view.assert_writable(events, event['project']['key'], event['thread_id'], event['event_id'])
+    existing=next((e for e in events if e['event_id']==event['event_id']),None)
+    same=[e for e in events if e['project']['key']==event['project']['key'] and e['thread_id']==event['thread_id']]
+    if existing:
+        if {k:v for k,v in existing.items() if not k.startswith('_')} != event:
+            raise ValueError('event_id already exists with different content')
+        return events,same,existing
+    if event['kind']=='submit':
+        current=reduce_workflow(same,view.now_utc())
+        if current['claim'] is None or view.parse_ts(current['claim']['lease_until']) <= view.now_utc():
+            raise ValueError('claim expired; reclaim before submission')
+    w=reduce_workflow(same+[event],view.now_utc())
+    if w['errors']: raise ValueError('; '.join(w['errors']))
+    if event['kind'] == 'claim' and view.parse_ts(event['lease_until']) <= view.now_utc():
+        raise ValueError('new claim already expired')
+    return events,same,None
+
+
+def _post_fetch(root, event, rel, *, before_push=None, landed=None):
+    """Default transport: fetch, validate against the fetched tree, add the event as one commit through the object
+    store, push; a rejected push (another writer won) fetches again and revalidates, three attempts."""
+    repo=bt.Repo(root)
+    encrypted='git-crypt' in run(repo.top,'check-attr','filter','--',repo.prefix+str(rel)).stdout.decode()
+    text=(json.dumps(event,ensure_ascii=False,indent=2)+'\n').encode()
+    for attempt in range(3):
+        with snapshot(root,fresh=attempt>0) as dest:
+            if not (dest/bc.CONFIG).is_file():
+                # Fail closed: an unpushed local board.json must not decide who reads a post (measured: a migration window).
+                raise ValueError(f'the remote of this board has no {bc.CONFIG} yet: commit and push it before posting')
+            cfg=bc.load(dest)  # the remote's settings decide, not a stale local copy
+            if cfg['encryption']=='git-crypt' and not encrypted: raise ValueError('board event encryption is not configured')
+            base=(dest/bt.BASE_FILE).read_text().strip()
+            try:
+                events,same,existing=_validate_post(dest,event,cfg)
+            except ValueError:
+                # Refused against a read reused from seconds ago: another writer may have moved the thread
+                # (measured in a test mixing transports). Read the remote again before deciding.
+                if attempt==0 and _REUSED: continue
+                raise
+            if existing:
+                if landed is not None: landed[:]=same
+                return event['event_id']
+        blob=repo.write_blob(str(rel),text)
+        if cfg['encryption']=='git-crypt' and not repo.blob_bytes(blob).startswith(view.GITCRYPT_MAGIC): raise ValueError('refusing to push an unencrypted event')
+        sha=repo.commit(base,str(rel),blob)
+        if before_push: before_push(attempt)
+        if repo.push(sha):
+            fetched(root,sha); repo.notify(sha); repo.fast_forward(sha,cfg['audience'])
+            if landed is not None: landed[:]=same+[event]
+            return event['event_id']
+    raise ValueError('posting failed after three attempts; use retry with the saved --event-id')
+
+
+def _post_clone(root, event, rel, *, before_push=None, landed=None):
+    """Previous transport (AGENT_BOARD_TRANSPORT=clone): post through a temporary clone of the remote."""
+    with snapshot_clone(root) as dest:
         if not (dest/bc.CONFIG).is_file():
             # Fail closed: an unpushed local board.json must not decide who reads a post (measured: a migration window).
             raise ValueError(f'the remote of this board has no {bc.CONFIG} yet: commit and push it before posting')
         cfg=bc.load(dest)  # the remote's settings decide, not a stale local copy
-        if cfg['audience']=='collaborators' and event['source_policy']!='ordinary':
-            raise ValueError('a collaborators board takes ordinary posts only')
-        if cfg['audience']=='collaborators' and event['project']['key'] not in cfg['sources']:
-            raise ValueError(f"project {event['project']['key']} is not a source of this board")
         # Global user identity may be absent in test/CI; inherit transport identity only.
         for field in ('user.name','user.email'):
             v=run(root,'config','--get',field,check=False).stdout.decode().strip()
@@ -316,23 +418,10 @@ def post(root, event, *, before_push=None, landed=None):
         if cfg['encryption']=='git-crypt' and not encrypted: raise ValueError('board event encryption is not configured')
         branch=cfg['branch']
         for attempt in range(3):
-            events=read(dest)
-            view.assert_writable(events, event['project']['key'], event['thread_id'], event['event_id'])
-            existing=next((e for e in events if e['event_id']==event['event_id']),None)
-            same=[e for e in events if e['project']['key']==event['project']['key'] and e['thread_id']==event['thread_id']]
+            events,same,existing=_validate_post(dest,event,cfg)
             if existing:
-                if {k:v for k,v in existing.items() if not k.startswith('_')} != event:
-                    raise ValueError('event_id already exists with different content')
                 if landed is not None: landed[:]=same
                 return event['event_id']
-            if event['kind']=='submit':
-                current=reduce_workflow(same,view.now_utc())
-                if current['claim'] is None or view.parse_ts(current['claim']['lease_until']) <= view.now_utc():
-                    raise ValueError('claim expired; reclaim before submission')
-            w=reduce_workflow(same+[event],view.now_utc())
-            if w['errors']: raise ValueError('; '.join(w['errors']))
-            if event['kind'] == 'claim' and view.parse_ts(event['lease_until']) <= view.now_utc():
-                raise ValueError('new claim already expired')
             p=dest/rel; p.parent.mkdir(parents=True,exist_ok=True)
             p.write_text(json.dumps(event,ensure_ascii=False,indent=2)+'\n')
             run(dest,'add','--',str(rel)); run(dest,'commit','--quiet','-m','Add event')
@@ -579,6 +668,18 @@ def event_from(a, events):
     return ev
 
 
+def reviewer_for(a, cfg):
+    """The reviewer session id of a request: --reviewer, else the environment default (owner boards, ordinary
+    posts; `<project>` expands to the project key), else None (the requester stays the reviewer)."""
+    r=(getattr(a,'reviewer',None) or '').strip()
+    if not r and a.policy=='ordinary' and cfg.get('audience')=='owner':
+        r=(os.environ.get(DEFAULT_REVIEWER_ENV) or '').strip().replace('<project>',a.project or '')
+    if not r: return None
+    if r==a.session: return None
+    if r==a.to_session: raise ValueError('reviewer and assignee sessions must differ')
+    return r
+
+
 def outbox_dir(root):
     """Where an attempted post is kept for `retry`: never inside a tracked tree."""
     root=Path(root)
@@ -712,7 +813,9 @@ def main():
     ap.add_argument('--preview',action='store_true',help='validate and show the proposed event without posting')
     ap.add_argument('--json',action='store_true',help='inbox: waiting rows; show: one request object; boards: the list; warnings go to stderr')
     ap.add_argument('--include-closed',action='store_true',help='inbox: also show completed requests involving this exact session (not actionable)')
-    ap.add_argument('--interval',type=float,default=120,help='watch: seconds between synced reads')
+    ap.add_argument('--interval',type=float,default=30,help='watch: seconds between remote checks (default transport: one ls-remote round trip, a read only when the branch moved; clone transport: a full read)')
+    ap.add_argument('--reviewer',help='request: the session that receives the submission (default: the requester; env '
+                    f'{DEFAULT_REVIEWER_ENV} with <project> on an owner board). A role id outlives this session; posted as a reviewer handover right after the request')
     ap.add_argument('--max-minutes',type=float,default=240,help='watch: give up after this long (exit 3)')
     ap.add_argument('--since',help='watch: treat events after this event id as new (resume after a restart)')
     ap.add_argument('--quiet-kind',action='append',default=[],choices=sorted(KINDS),
@@ -781,15 +884,26 @@ def main():
         if not a.request: ap.error('watch requires --request')
         me={'agent':a.agent,'session_id':a.session}; deadline=time.time()+a.max_minutes*60; key=None; seen=None
         quiet=set(a.quiet_kind); pending=[]
+        # Default transport: between reads, the remote's branch head is asked with `ls-remote` (one round trip, no
+        # transfer) every --interval seconds, and the local `last-push` note of this machine's posters every
+        # NOTIFY_POLL_S; the thread is read again only when either moved. The clone transport reads every interval.
+        repo=bt.Repo(a.root) if bt.transport()!='clone' else None; last_remote=last_note=None
         while True:
             try:
-                with snapshot(a.root) as root:
+                if repo is not None and key is not None:
+                    remote,note=repo.ls_remote(),repo.notified()
+                    if (remote,note)==(last_remote,last_note):
+                        if time.time()+NOTIFY_POLL_S>deadline: print('watch: 新しい書き込みなし (時間切れ)'); sys.exit(3)
+                        time.sleep(NOTIFY_POLL_S); continue
+                    last_remote,last_note=remote,note
+                with snapshot(a.root,fresh=True) as root:
                     events=read(root)
                     if key is None:
                         found=[k for k,t in view.derive(events,view.now_utc()).items()
                                if (t.get('workflow') or {}).get('request_id')==a.request]
                         if len(found)!=1: raise ValueError('request not found or ambiguous: '+a.request)
                         key=found[0]
+                        if repo is not None: last_remote,last_note=repo.remote_sha(),repo.notified()
                     thread=[e for e in events if (e['project']['key'],e['thread_id'])==key]
             except Exception as ex:  # noqa: BLE001  only sync failures are retried, see transient_sync_error
                 if not transient_sync_error(ex): raise
@@ -808,7 +922,12 @@ def main():
                 return
             seen.update(ids)
             if time.time()+a.interval>deadline: print('watch: 新しい書き込みなし (時間切れ)'); sys.exit(3)
-            time.sleep(a.interval)
+            if repo is None: time.sleep(a.interval); continue
+            # wait out the interval, waking early when a poster on this machine notes a push
+            end=time.time()+a.interval
+            while time.time()<end:
+                time.sleep(min(NOTIFY_POLL_S,max(0.0,end-time.time())))
+                if repo.notified()!=last_note: break
     if a.command=='sessions':
         with snapshot(a.root) if a.sync else contextlib.nullcontext(a.root) as root:
             events=read(root)
@@ -943,6 +1062,20 @@ def main():
             print(f'この thread ({a.project}/{a.thread}) で file を持つ session は他に居ない = 最後の 1 本。')
         return
     rid = ev['event_id'] if a.command=='request' else a.request
+    if a.command=='request':
+        reviewer=reviewer_for(a,cfg)
+        if reviewer:
+            # The receipt right moves to a standing id now, as one more event (old readers understand a handover):
+            # the requesting window may close before the submission arrives (measured: most receipts after a
+            # window closed needed a hand-written handover first).
+            import copy
+            h=copy.copy(a); h.command='handover'; h.request=ev['event_id']; h.reply_to=ev['event_id']; h.to=a.agent; h.to_session=reviewer
+            h.role='reviewer'; h.event_id=None; h.touch=None; h.deliverable=[]; h.reference=[]; h.acceptance=None
+            h.summary=None if a.policy=='encrypted-metadata-only' else f'検収役 = {reviewer} (依頼元 {a.session[:8]} の window が閉じても受領できる id。 依頼元が生きていれば同じ id で受領する)'
+            hev=event_from(h,events+[ev])
+            probs=errors(hev,json.loads(SCHEMA_PATH.read_text()))+[x for x in reduce_workflow(same+[ev,hev],view.now_utc())['errors'] if x.startswith(hev['event_id']+':')]
+            if probs: raise ValueError('reviewer handover: '+'; '.join(probs))
+            print('posted '+post(a.root,hev)+f' (検収役 = {a.agent}/{reviewer}: 提出は inbox --session {reviewer} に載る。 受領は --session {reviewer} --session-name \'<native id 8 chars> (<model>)\' で accept / revise)')
     if rid and a.command in {'request','claim','submit','blocker','revise','update'}:
         # A post is a record, not a push: the other side's reply reaches this session only if it reads again.
         if a.agent=='codex':
