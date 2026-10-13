@@ -17,6 +17,9 @@
 
     # 3. 変更行の列挙 (前版 / 後版の行番号つき、 hunk 単位)
     python3 check-rename-purity.py --before old.tex --after new.tex --classify
+    # 4. 単射でない改名 (旧い綴り 2 つ -> 新しい綴り 1 つ) は逆写像で畳めない -> 前向きに当てて照合
+    #    (map は old->new として読む。 行数が同じこと、 変わった行 = 前版の像、 変わらない行に旧い綴りが残らない)
+    python3 check-rename-purity.py --before old.tex --after new.tex --map forward.json --forward --strict
 
 map file (JSON):
 
@@ -139,6 +142,37 @@ def census(lines: list[str], pattern: str, section_re: str) -> dict[str, list[tu
     return out
 
 
+def forward_check(before: list[str], after: list[str], rules: list[dict]
+                  ) -> tuple[int, list[tuple[int, str, str, str]], list[tuple[int, str]]]:
+    """Forward purity for a line-count-preserving rewrite: apply the rules old -> new to each
+    before-line (in order, honouring each rule's scope). Returns (changed, unexplained, missed):
+    unexplained = changed lines whose after-text is not the forward image of the before-text
+    (an edit the map does not explain), missed = unchanged lines that still contain a rule's
+    old text (an occurrence the rewrite skipped). Use when the rename is not injective (two old
+    spellings -> one new one), where the inverse map cannot fold the after-file back."""
+    unexplained: list[tuple[int, str, str, str]] = []
+    missed: list[tuple[int, str]] = []
+    changed = 0
+    n = len(before)
+    for i, (x, y) in enumerate(zip(before, after), 1):
+        z = x
+        for r in rules:
+            lo, hi = r.get("scope", [1, n])
+            if not (lo <= i <= hi):
+                continue
+            if r.get("kind", "literal") == "literal":
+                z = z.replace(r["old"], r["new"])
+            else:
+                z = re.sub(r["old"], r["new"], z)
+        if x != y:
+            changed += 1
+            if z != y:
+                unexplained.append((i, x, y, z))
+        elif z != x:
+            missed.append((i, x))
+    return changed, unexplained, missed
+
+
 def forbid_scan(lines: list[str], patterns: list[str]) -> list[tuple[int, str, str]]:
     """Surviving old spellings: [(line_number, pattern, text)]. Comments are scanned too."""
     hits: list[tuple[int, str, str]] = []
@@ -170,7 +204,8 @@ def allowed(text: str, allow: list[re.Pattern]) -> bool:
 
 def run(before_p: Path, after_p: Path, map_p: Path | None, allow_p: Path | None,
         forbid: list[str], strict: bool, classify: bool,
-        census_re: str | None = None, section_re: str = r"\\(?:sub)*section\*?\{([^}]*)\}") -> int:
+        census_re: str | None = None, section_re: str = r"\\(?:sub)*section\*?\{([^}]*)\}",
+        forward: bool = False) -> int:
     before = before_p.read_text(encoding="utf-8").split("\n") if before_p else []
     after = after_p.read_text(encoding="utf-8").split("\n")
 
@@ -196,6 +231,26 @@ def run(before_p: Path, after_p: Path, map_p: Path | None, allow_p: Path | None,
         return 0
 
     rules = json.loads(map_p.read_text(encoding="utf-8"))["rules"] if map_p else []
+    if forward:
+        if len(before) != len(after):
+            print(f"FAILED: --forward needs the same line count ({len(before)} -> {len(after)}); "
+                  "use the inverse map instead")
+            return 1
+        changed, unexpl, missed = forward_check(before, after, rules)
+        print(f"[info] rules (old -> new): {len(rules)}   changed lines: {changed}")
+        for num, x, y, z in unexpl:
+            print(f"[UNEXPLAINED] line {num}\n   before : {x[:150]}\n   after  : {y[:150]}\n"
+                  f"   forward: {z[:150]}")
+        for num, x in missed:
+            print(f"[MISSED] line {num} still has an old spelling: {x[:150]}")
+        bad = len(unexpl) + len(missed)
+        print()
+        if bad:
+            print(f"FAILED: {len(unexpl)} changed line(s) not explained by the forward map, "
+                  f"{len(missed)} unchanged line(s) still matching an old spelling")
+            return 1 if strict else 0
+        print("ALL PASS (every changed line is the forward image of its before-line; nothing missed)")
+        return 0
     mapped = apply_rules(after, rules)
     diff = residual_diff(before, mapped)
     res = residual_lines(diff)
@@ -323,6 +378,28 @@ def selftest() -> int:
         rc_ok = run(d / "b.tex", d / "a.tex", d / "map.json", d / "allow2.txt", [], True, False)
         check("strict PASSES once every residual is on the allow list", rc_ok == 0)
 
+    # --forward: a non-injective rename (two old spellings -> one new spelling) cannot be folded
+    # back by an inverse map, but the forward image explains it
+    f_before = [r"S = (P^{(0sw)}+P^{(0ws)})_{ab}", r"T = \sqrt3\,P^{(sw)}", r"U = P^{(0s)}", r"V = P^{(0s)}"]
+    f_after = [r"S = (P^{(0)\perp\parallel}+P^{(0)\parallel\perp})_{ab}",
+               r"T = \sqrt3\,(P^{(0)\perp\parallel}+P^{(0)\parallel\perp})", r"U = P^{(0)\perp}",
+               r"V = P^{(0s)}"]
+    f_rules = [{"old": r"P^{(sw)}", "new": r"(P^{(0)\perp\parallel}+P^{(0)\parallel\perp})"},
+               {"old": r"P^{(0sw)}", "new": r"P^{(0)\perp\parallel}"},
+               {"old": r"P^{(0ws)}", "new": r"P^{(0)\parallel\perp}"},
+               {"old": r"P^{(0s)}", "new": r"P^{(0)\perp}"}]
+    ch, un, mi = forward_check(f_before, f_after, f_rules)
+    check("--forward explains a non-injective rename (changed lines 1-3)", ch == 3 and un == [])
+    check("--forward reports the skipped occurrence on line 4  [foil]", [n for n, _ in mi] == [4])
+    flip = list(f_after)
+    flip[2] = r"U = -P^{(0)\perp}"
+    _, un2, _ = forward_check(f_before, flip, f_rules)
+    check("--forward flags an edit hidden in a renamed line (sign flip)  [foil]",
+          [n for n, *_ in un2] == [3])
+    inv = [{"kind": "literal", "new": r["new"], "old": r["old"]} for r in f_rules]
+    res_inv = residual_lines(residual_diff(f_before, apply_rules(f_after, inv)))
+    check("the inverse map cannot fold the same rename back (why --forward exists)", len(res_inv) > 0)
+
     print("\nALL PASS" if ok else "\nFAILED")
     return 0 if ok else 1
 
@@ -332,7 +409,11 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--before", type=Path, help="manuscript before the mechanical edit")
     p.add_argument("--after", type=Path, help="manuscript after it")
-    p.add_argument("--map", type=Path, help="JSON file of new->old inverse rules")
+    p.add_argument("--map", type=Path, help="JSON file of new->old inverse rules (old->new with --forward)")
+    p.add_argument("--forward", action="store_true",
+                   help="apply the map old->new to --before and require every changed line to be the "
+                        "forward image and no unchanged line to keep an old spelling (same line count; "
+                        "for renames that are not injective, where the inverse map cannot fold back)")
     p.add_argument("--allow", type=Path, help="file of regexes for residual lines that are expected")
     p.add_argument("--forbid", action="append", default=[],
                    help="regex whose survival in --after is an orphan (repeatable)")
@@ -358,7 +439,7 @@ def main() -> int:
         p.error("--before and --after are required (or --selftest)")
     if not a.classify and not a.map:
         p.error("--map is required unless --classify")
-    return run(a.before, a.after, a.map, a.allow, a.forbid, a.strict, a.classify)
+    return run(a.before, a.after, a.map, a.allow, a.forbid, a.strict, a.classify, forward=a.forward)
 
 
 if __name__ == "__main__":

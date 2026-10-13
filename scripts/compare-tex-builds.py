@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """2 版の LaTeX build を機械比較する組版 gate: log から error / 未定義参照 / overfull を折返し復元して数え、.aux の label→頁 写像の drift を出し (= 総頁数が同じでも中の頁割りは動く)、配布 PDF を自分の build が再現するかを pdftotext で証明する。--selftest 内蔵、規律 = conventions/edit-intent-record.md#build-gate
 
-3 つの独立した機能。 どれも他版・他者の成果物を読む前に回す。
+4 つの独立した機能。 どれも他版・他者の成果物を読む前に回す。
 
 1. **log 比較** (`--before-log / --after-log`): error 数・未定義参照・未定義引用・多重定義・頁数・
    overfull/underfull を両版で出し、 **後版で新たに出たものだけ**を名指しする。 改稿で増えた組版警告と
@@ -19,11 +19,16 @@
    overfull・行かぶり) を source に帰属してよい。 0 行でないなら、 見ているものは相手の版ではなく
    自分の pipeline の産物かもしれない (engine 差の実例 = claude-config latex.md#latexmk-pdf-overrides-rc)。
 
+4. **文字の多重集合** (`--chars before.pdf after.pdf`): 2 つの PDF の文字を数で比べる (空白・accent・
+   行末の hyphenation は除く)。 記号を飾るだけの pass (hat・太字の macro) なら 0 になる = 飾り以外の
+   文字が 1 つも変わっていない証拠。 改名する pass (文字が変わる) には使えない。
+
 使い方:
 
     python3 compare-tex-builds.py --before-log before/main.log --after-log after/main.log \
         --before-aux before/main.aux --after-aux after/main.aux
     python3 compare-tex-builds.py --reproduce distributed.pdf --built mybuild/main.pdf
+    python3 compare-tex-builds.py --chars before/main.pdf after/main.pdf
     python3 compare-tex-builds.py --build-cmd 'pdflatex -interaction=nonstopmode main'   # 参考出力のみ
 
 `--strict` で、 後版にだけ在る error / 未定義参照 / 多重定義があれば exit 1 (overfull は既定で
@@ -125,6 +130,25 @@ def text_diff_count(a: list[str], b: list[str]) -> int:
     return sum(1 for d in difflib.unified_diff(a, b, lineterm="", n=0)
                if (d.startswith("-") or d.startswith("+"))
                and not d.startswith("---") and not d.startswith("+++"))
+
+
+ACCENT_GLYPHS = set("^ˆ˜¯˙")  # spacing hat / tilde / macron / dot as pdftotext emits them
+
+
+def char_multiset_diff(a: list[str], b: list[str]) -> dict[str, int]:
+    """{char: count in b - count in a} over the non-space characters of two pdftotext outputs,
+    ignoring accents (combining marks and the spacing accent glyphs) and end-of-line hyphenation.
+    Zero = the two PDFs carry the same letters: a pass that only decorates symbols (a hat, a bold
+    macro) changed nothing else. Not a proof for passes that rename (the letters change there)."""
+    import unicodedata
+    from collections import Counter
+
+    def chars(lines: list[str]) -> Counter:
+        t = "\n".join(lines).replace("-\n", "")
+        return Counter(ch for ch in t if not ch.isspace() and not unicodedata.combining(ch)
+                       and ch not in ACCENT_GLYPHS)
+    ca, cb = chars(a), chars(b)
+    return {k: cb.get(k, 0) - ca.get(k, 0) for k in set(ca) | set(cb) if ca.get(k, 0) != cb.get(k, 0)}
 
 
 # ---------------------------------------------------------------- build
@@ -379,6 +403,14 @@ def selftest() -> int:
     else:
         print("[SKIP] end-to-end build check (pdflatex or git not on PATH)")
 
+    # character multiset: accents and hyphenation do not count, a real letter does
+    base = ["The field e and the connection w-", "ord appear."]
+    hatted = ["The field ê and the connection wˆord", "appear."]
+    check("char multiset: an accent and a line-end hyphen are not a difference",
+          char_multiset_diff(base, hatted) == {})
+    check("char multiset: a changed letter is a difference  [foil]",
+          char_multiset_diff(base, ["The field f and the connection word", "appear."]) == {"e": -1, "f": 1})
+
     print("\nALL PASS" if ok else "\nFAILED")
     return 0 if ok else 1
 
@@ -392,6 +424,9 @@ def main() -> int:
     p.add_argument("--after-aux", type=Path)
     p.add_argument("--reproduce", type=Path, help="PDF you were given")
     p.add_argument("--built", type=Path, help="PDF you built yourself")
+    p.add_argument("--chars", nargs=2, type=Path, metavar=("BEFORE_PDF", "AFTER_PDF"),
+                   help="compare the letters of two PDFs as a multiset, ignoring accents, spaces and "
+                        "line-end hyphenation (a decoration-only pass must give 0)")
     p.add_argument("--build", metavar="SPEC",
                    help="typeset SPEC and report its log/aux. SPEC = path to a .tex, or "
                         "REV:file.tex to take the whole revision via `git archive` "
@@ -426,6 +461,15 @@ def main() -> int:
             drift = aux_drift(parse_aux(one["aux"].read_text(encoding="latin-1")),
                               parse_aux(two["aux"].read_text(encoding="latin-1")))
         return report(one["parsed"], two["parsed"], drift, a.strict, a.strict_overfull)
+
+    if a.chars:
+        d = char_multiset_diff(pdf_text(a.chars[0]), pdf_text(a.chars[1]))
+        tot = sum(abs(v) for v in d.values())
+        print(f"[{'PASS' if tot == 0 else 'FAIL'}] characters differing (accents, spaces and line-end "
+              f"hyphenation ignored): {tot}")
+        for k, v in sorted(d.items(), key=lambda kv: -abs(kv[1]))[:40]:
+            print(f"   {k!r}: {v:+d}")
+        return 0 if tot == 0 else 1
 
     if a.reproduce and a.built:
         n = text_diff_count(pdf_text(a.reproduce), pdf_text(a.built))
