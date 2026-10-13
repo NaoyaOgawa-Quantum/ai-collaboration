@@ -14,9 +14,12 @@ Usage
           .tex includes are stripped of comments in the sandbox copy (strip-tex-comments.py; the source is
           untouched), and every include is checked with check-review-target.py: a .tex / .md that still carries
           comment text is refused.  --keep-comments copies them as they are (a non-blind pass).
-  make-review-sandbox.py collect <slug> --into DEST_DIR [--root ...]
-        → copies REVIEW-RESULTS.md, STAGE*-RESULTS.md (+ ledger.yaml / notes/ / checks/ if present) into DEST_DIR,
-          never the other way.  Prints the contamination-grep reminder.
+  make-review-sandbox.py collect <slug> --into DEST_DIR [--root ...] [--include-literature]
+        → copies REVIEW-RESULTS.md, STAGE*-RESULTS.md (+ ledger.yaml / HANDOFF.md / notes/ / checks/ / scratch/ if present)
+          into DEST_DIR, never the other way.  Prints the contamination-grep reminder.  Pass the same --root as create.
+          The literature the reviewer downloaded into scratch/ (PDF, e-print archives, and the text extracted from them =
+          a file with the same name stem) is not copied: it is someone else's copyrighted work and DEST_DIR is often a
+          repository or a synced folder shared with collaborators (measured).  The originals stay in the sandbox; --include-literature copies them anyway.
   make-review-sandbox.py --selftest
 
 Before --include, clean the review markup: review-markup-clean.py (colour / Q&A).  create strips the
@@ -104,10 +107,25 @@ def create(root: Path, slug: str, spec: Path, includes: list[Path], keep_comment
     return sb
 
 
-def collect(root: Path, slug: str, into: Path) -> list[Path]:
+LITERATURE_SUFFIXES = (".pdf", ".tar.gz", ".tgz", ".tar", ".djvu", ".epub")
+
+
+def _literature_ignore(skipped: list[Path]):
+    """copytree ignore: downloaded literature + text extracted from it (same stem), recorded in `skipped`."""
+    def ignore(dirpath, names):
+        bases = {n[: -len(suf)] for n in names for suf in LITERATURE_SUFFIXES if n.lower().endswith(suf)}
+        out = {n for n in names
+               if any(n.lower().endswith(suf) for suf in LITERATURE_SUFFIXES) or Path(n).stem in bases}
+        out = {n for n in out if not (Path(dirpath) / n).is_dir()}
+        skipped.extend(Path(dirpath) / n for n in sorted(out))
+        return out
+    return ignore
+
+
+def collect(root: Path, slug: str, into: Path, include_literature: bool = False) -> list[Path]:
     sb = root / slug
     if not sb.exists():
-        raise SystemExit(f"✗ no sandbox at {sb}")
+        raise SystemExit(f"✗ no sandbox at {sb} (made with another --root? pass the same --root as create)")
     into.mkdir(parents=True, exist_ok=True)
     copied: list[Path] = []
     top_files = [sb / name for name in ("REVIEW-RESULTS.md", "ledger.yaml", "HANDOFF.md")]
@@ -121,10 +139,15 @@ def collect(root: Path, slug: str, into: Path) -> list[Path]:
                 print(f"  ↷ kept existing {dest} (differs from sandbox copy; delete it first if you really want the sandbox version)")
                 continue
             shutil.copy2(p, dest); copied.append(dest)
+    skipped: list[Path] = []
     for sub in ("notes", "checks", "scratch"):  # scratch too: a worker's scripts are never discarded (hoist station)
         d = sb / sub
         if d.is_dir() and any(d.iterdir()):
-            shutil.copytree(d, into / sub, dirs_exist_ok=True); copied.append(into / sub)
+            ignore = None if include_literature or sub != "scratch" else _literature_ignore(skipped)
+            shutil.copytree(d, into / sub, dirs_exist_ok=True, ignore=ignore); copied.append(into / sub)
+    if skipped:
+        print(f"  ↷ not copied: {len(skipped)} literature file(s) in scratch/ (PDF / e-print / their text extracts;"
+              f" the originals stay in {sb / 'scratch'}). --include-literature copies them")
     return copied
 
 
@@ -157,6 +180,21 @@ def selftest() -> int:
         (Path(td) / "dest" / "REVIEW-RESULTS.md").write_text("annotated\n", encoding="utf-8")
         collect(root, "t1", Path(td) / "dest")
         assert (Path(td) / "dest" / "REVIEW-RESULTS.md").read_text(encoding="utf-8") == "annotated\n"  # second collect must not clobber
+        # downloaded literature (PDF / e-print / same-stem text extract) stays in the sandbox unless asked for
+        for name in ("cited_2401.00001.pdf", "cited_2401.00001.txt", "cited_src.tar.gz", "numbers.txt"):
+            (sb / "scratch" / name).write_text("x\n", encoding="utf-8")
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            collect(root, "t1", Path(td) / "dest-lit")
+        got_lit = sorted(q.name for q in (Path(td) / "dest-lit" / "scratch").iterdir())
+        assert got_lit == ["numbers.txt", "try.py"], got_lit
+        with contextlib.redirect_stdout(io.StringIO()):
+            collect(root, "t1", Path(td) / "dest-all", include_literature=True)
+        assert (Path(td) / "dest-all" / "scratch" / "cited_2401.00001.txt").exists()
+        try:
+            collect(Path(td) / "elsewhere", "t1", Path(td) / "dest-x"); raise AssertionError("should refuse a missing sandbox")
+        except SystemExit as e:
+            assert "--root" in str(e)
         # referee copy: .tex includes are stripped in the sandbox (the source is untouched), AGENTS.md for Codex
         tex = Path(td) / "note.tex"
         tex.write_text("% previous round: verdict incorrect, see plans/r.md\n\\section{A} % layout\ntext\n", encoding="utf-8")
@@ -176,14 +214,13 @@ def selftest() -> int:
             create(root, "t4", spec, [md]); raise AssertionError("should refuse an include that still carries comments")
         except SystemExit as e:
             assert "referee copy" in str(e) and "reject" not in str(e)
-        import contextlib, io
         dx = Path(td) / "deixis.tex"; dx.write_text("\\section{B}\nThe present version retains form A and has dropped form B.\n", encoding="utf-8")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             sb5 = create(root, "t5", spec, [dx])
         assert (sb5 / "deixis.tex").exists() and "not refused" in buf.getvalue(), "a warning is shown, not a refusal"
         assert "the spec wins" in CLAUDE_MD
-    print("selftest OK (19 checks)")
+    print("selftest OK (22 checks)")
     return 0
 
 
@@ -197,6 +234,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     ap.add_argument("--keep-comments", action="store_true",
                     help="create: copy .tex / .md includes as they are (a non-blind pass); the default strips and checks them")
+    ap.add_argument("--include-literature", action="store_true",
+                    help="collect: also copy the literature downloaded into scratch/ (PDF / e-print / their text extracts)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
     if a.selftest:
@@ -212,7 +251,7 @@ def main(argv: list[str]) -> int:
     if a.mode == "collect":
         if not (a.slug and a.into):
             ap.error("collect needs <slug> --into DEST_DIR")
-        got = collect(a.root, a.slug, a.into)
+        got = collect(a.root, a.slug, a.into, include_literature=a.include_literature)
         for g in got:
             print(f"✓ copied {g}")
         print("次: 禁止 source の語彙で汚染 grep → 主要 finding を別 script で独立再実装 → novel_to_requester / second_eye 記入")
