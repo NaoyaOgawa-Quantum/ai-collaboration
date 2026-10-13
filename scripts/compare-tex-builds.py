@@ -162,6 +162,11 @@ def build_one(spec: str, repo: Path, assets: Path | None, engine: str, out: Path
         src = Path(texfile)
         shutil.copy2(src, out / src.name)
         texfile = src.name
+        if assets is None:
+            # default = the .tex's own directory, so that the plain side of --build-against finds the same
+            # .bib / .bst / figures as the revision side (which is typeset in its own directory) does;
+            # without this the plain side reports undefined citations that the revision side does not
+            assets = src.parent
         if assets:
             for f in assets.iterdir():
                 if f.is_file() and f.suffix.lower() in (
@@ -353,6 +358,24 @@ def selftest() -> int:
                   "OLD-ASSET" in txt and "NEW-ASSET" not in txt)
             check("revision build produces a parsable log", built["parsed"] is not None)
             check("revision build records the source sha256", len(built["sha256"]) == 16)
+            # a .tex in a sub-directory: the revision side runs in that directory, the plain side copies
+            # that directory's assets by default -> both find the sibling .sty
+            (repo / "sub").mkdir()
+            (repo / "sub" / "mark.sty").write_text("\\newcommand\\subdirmarker{SUBDIR-ASSET}\n", encoding="utf-8")
+            (repo / "sub" / "s.tex").write_text(
+                "\\documentclass{article}\\usepackage{mark}\\begin{document}\\subdirmarker\\end{document}\n",
+                encoding="utf-8")
+            run_g("add", "-A")
+            run_g("commit", "-q", "-m", "v2")
+            rev2 = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            b_rev = build_one(f"{rev2}:sub/s.tex", repo, None, "pdflatex", Path(td) / "o2")
+            b_plain = build_one(str(repo / "sub" / "s.tex"), repo, None, "pdflatex", Path(td) / "o3")
+            for label, b in (("revision", b_rev), ("plain (no --assets)", b_plain)):
+                t = ""
+                if (b["dir"] / "s.pdf").exists() and shutil.which("pdftotext"):
+                    t = "\n".join(pdf_text(b["dir"] / "s.pdf"))
+                check(f"{label} build of a sub-directory .tex finds the sibling .sty", "SUBDIR-ASSET" in t)
     else:
         print("[SKIP] end-to-end build check (pdflatex or git not on PATH)")
 
@@ -376,7 +399,7 @@ def main() -> int:
     p.add_argument("--build-against", metavar="SPEC",
                    help="second SPEC; both are built and compared")
     p.add_argument("--repo", type=Path, default=Path("."), help="git repo for REV: specs")
-    p.add_argument("--assets", type=Path, help="dir with figures/bst/bib for a plain .tex build")
+    p.add_argument("--assets", type=Path, help="dir with figures/bst/bib for a plain .tex build (default: the .tex's own directory)")
     p.add_argument("--engine", default="pdflatex")
     p.add_argument("--out", type=Path, help="where to build (default: a temp dir, kept)")
     p.add_argument("--strict", action="store_true")
