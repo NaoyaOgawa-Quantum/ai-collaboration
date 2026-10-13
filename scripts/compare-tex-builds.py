@@ -152,7 +152,13 @@ def build_one(spec: str, repo: Path, assets: Path | None, engine: str, out: Path
         tar = subprocess.run(["git", "-C", str(repo), "archive", rev],
                              capture_output=True, check=True)
         subprocess.run(["tar", "-x", "-C", str(out)], input=tar.stdout, check=True)
+        # typeset from the .tex's own directory inside the archive, so that a .bib / .bst / figure
+        # sitting next to it is found the way the author's build finds it (bibtex searches the
+        # working directory, not the directory of the .tex)
+        workdir = out / Path(texfile).parent
+        texfile = Path(texfile).name
     else:
+        workdir = out
         src = Path(texfile)
         shutil.copy2(src, out / src.name)
         texfile = src.name
@@ -168,13 +174,15 @@ def build_one(spec: str, repo: Path, assets: Path | None, engine: str, out: Path
              [engine, "-interaction=nonstopmode", "-halt-on-error", texfile]]
     codes = []
     for cmd in steps:
-        r = subprocess.run(cmd, cwd=out, capture_output=True, text=True)
+        # the engine's terminal output can carry non-UTF-8 bytes (e.g. a .bib in latin-1);
+        # it is not parsed here, so decode leniently instead of aborting the build
+        r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, errors="replace")
         codes.append(r.returncode)
-    log = out / f"{stem}.log"
-    aux = out / f"{stem}.aux"
-    return {"dir": out, "log": log, "aux": aux, "exit_codes": codes,
+    log = workdir / f"{stem}.log"
+    aux = workdir / f"{stem}.aux"
+    return {"dir": workdir, "log": log, "aux": aux, "exit_codes": codes,
             "parsed": parse_log(log.read_text(encoding="latin-1")) if log.exists() else None,
-            "sha256": _sha256(out / texfile)}
+            "sha256": _sha256(workdir / texfile)}
 
 
 def _sha256(p: Path) -> str:
