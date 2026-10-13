@@ -413,6 +413,23 @@ class Note(unittest.TestCase):
         self.assertIn('--reference',str(cm.exception))
         a.reference=['results/independent-review.md']
         self.assertEqual(board.event_from(a,[r,c,sub])['references'],['results/independent-review.md'])
+    def test_accept_without_reply_to_names_the_latest_submission(self):
+        # Without this the post died with the schema's bare "$: missing reply_to" (measured).
+        import argparse
+        r,c,sub=chain()
+        a=argparse.Namespace(command='accept',policy='ordinary',source=Path('/nonexistent/example'),project=None,thread=None,repo=None,
+            request=r['event_id'],summary='checked',acceptance=None,agent='claude',session='claude-session-001',session_name=None,instance=None,
+            event_id=None,reply_to=None,lease_hours=12,reference=['results/independent-review.md'],deliverable=[],to=None,to_session=None,role=None)
+        with self.assertRaises(ValueError) as cm: board.event_from(a,[r,c,sub])
+        self.assertIn(f"the latest submission is {sub['event_id']}",str(cm.exception))
+        a.reply_to=sub['event_id']
+        self.assertEqual(board.event_from(a,[r,c,sub])['reply_to'],sub['event_id'])
+    def test_non_participant_update_names_the_sessions_to_post_as(self):
+        # The bare "not a workflow participant" did not say which --session to use (measured: the requester's own id was refused).
+        r,c,sub=chain()
+        stray=event('update',3,agent='claude'); stray['actor']['session_id']='claude-stray-session'
+        errs=' '.join(str(x) for x in reduce_workflow([r,c,stray],NOW+dt.timedelta(seconds=30))['errors'])
+        self.assertIn('--session claude-session-001',errs); self.assertIn('--session codex-session-001',errs)
     def test_actor_task_is_session_name_not_summary(self):
         import argparse
         base=dict(command='note',policy='ordinary',source=Path('/nonexistent/example'),project='example',thread='2026-09-07-x',repo='o/example',

@@ -121,7 +121,7 @@ def apply(s, e, seen):
             need(e['source_policy'] == 'encrypted-metadata-only' or bool(e.get('deliverables')), 'deliverable location required')
             s.update(submission=e, status='submitted', blocker=None)
     elif kind in {'accept','revise'}:
-        need(reviewer, 'only designated reviewer session can review')
+        need(reviewer, f"only designated reviewer session can review: post with --session {s['reviewer']['session_id']}")
         need(s['status'] == 'submitted', 'no submission awaiting receipt')
         need(e.get('reply_to') == s['submission']['event_id'], 'reply_to must identify latest submission')
         s.update(status='accepted' if kind == 'accept' else 'revision', blocker=None, review=e)
@@ -130,7 +130,9 @@ def apply(s, e, seen):
         need(s['status'] in {'working','revision','blocked'}, 'cannot block at this stage')
         s.update(status='blocked', blocker=e, question=e, answer=None)
     else:
-        need(reviewer or (claim is not None and identity(e) == identity(claim)), 'not a workflow participant')
+        need(reviewer or (claim is not None and identity(e) == identity(claim)),
+             f"not a workflow participant: post with --session {s['reviewer']['session_id']} (the reviewer side)"
+             + (f" or --session {claim['actor']['session_id']} (the current claimant)" if claim is not None else ''))
         if s['status'] == 'blocked' and kind == 'update' and reviewer:
             need(e.get('reply_to') == s['blocker']['event_id'],
                  f"reply_to must identify the blocker being answered: the open blocker is {s['blocker']['event_id']}"

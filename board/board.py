@@ -641,6 +641,11 @@ def event_from(a, events):
         if req is None: raise ValueError('--request must identify an existing request')
         if req['source_policy']!=a.policy: raise ValueError('source policy differs from request')
         pk,tid,repo=req['project']['key'],req['thread_id'],req['project']['repo']
+        if a.command in ('accept','revise') and not a.reply_to:
+            # Name the submission here instead of the schema's bare "$: missing reply_to" (measured: the reviewer could not tell what was missing).
+            subs=[e for e in events if e.get('request_id')==a.request and e['kind']=='submit']
+            latest=max(subs,key=lambda e:e['created_at'])['event_id'] if subs else None
+            raise ValueError(f'{a.command} needs --reply-to <the submission you checked>'+(f': the latest submission is {latest}' if latest else ': no submission yet'))
     kind=a.command
     # Existing template supplies metadata; workflow fields are added below.
     ev,path=view.build_template(kind='update',project=pk,thread=tid,task=a.session_name or 'workflow',agent=a.agent,
