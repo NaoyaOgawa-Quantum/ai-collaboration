@@ -34,6 +34,7 @@ summary: AI による原稿改稿の意図記録 (edit-intent record) + 実装 p
 6. <a id="gate-before-commit"></a>**commit 前に check を PASS させる**。 sidecar は原稿と同じ pass で commit し、 decision ledger から sidecar の path と head hash へ pointer を張る。 gate は散文でなく exit code (= cold な worker session に散文規律は効かない、 [`physics-verification-cycle.md#campaign-tooling`](physics-verification-cycle.md#campaign-tooling) E と同じ理由)。
 7. **記録するのは意図であって正当化ではない**。 対応表の 意図 は 1 行。 長い理由は裁量の節へ。 物理の議論は ledger か note へ。
 8. **遡及作成はしない**。 規則は導入後の pass から。 過去の pass は事後棚卸し record (audit) が代替する。
+9. <a id="no-draft-color-marks"></a>**AI が原稿に入れた文を、 印字面の色や印で区別しない**。 著者が裁定した変更も、 著者がまだ読んでいない試稿 (保護領域の外に足す節・付録の初稿) も、 地の文で入れる。 `\cl{}` のような着色の macro・下線・欄外の印で包まない。 裁定を待つ状態は印字面でなく、 決定 ledger の未決の項目と、 その箇所の `% PROPOSAL` で始まる comment で追い、 pass の対応表では 種類 = 裁量 に挙げる (規則 3)。 理由 (実測) = 裁定が進むと、 色の付いた文と付いていない文の境が裁定の有無と合わなくなり、 印は読む人の雑音になる。 投稿前と latexdiff の前に外す手間も増える (§8 と [`latex.md`](../../claude-config/conventions/latex.md) の markup unwrap)。 保護領域に入れること自体の可否は [`manuscript-claim-ownership.md#rule`](../../claude-config/conventions/manuscript-claim-ownership.md#rule) が決める。 提案の注記を PDF に印字するかは、 同じ節の 2 のとおり repo の慣行と著者の指示で決まる。 本規則が決めるのは、 地の文に入れた AI の文の印である。 著者が自分の推敲に使う一時的な着色 ([`latex.md#preamble-macros-first`](../../claude-config/conventions/latex.md#preamble-macros-first) の author drafting marker) は著者の物で、 本規則の主語は AI である。
 
 ## <a id="sidecar-format"></a>3. sidecar の形式
 
