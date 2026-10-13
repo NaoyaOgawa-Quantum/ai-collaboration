@@ -629,7 +629,7 @@ def check_review_target(a):
 def event_from(a, events):
     restricted=a.policy=='encrypted-metadata-only'
     if a.command=='request' or (a.command=='note' and not a.request):
-        if not restricted and a.project != a.source.resolve().name: raise ValueError('project must equal source checkout basename')
+        if not restricted and a.project != a.source.resolve().name.replace('_', '-'): raise ValueError('project must equal source checkout basename (underscores written as hyphens)')
         if not a.thread or (not restricted and not a.project): raise ValueError(f'{a.command} needs --thread and --project (or restricted policy)')
         if a.command=='request':
             if not a.to or not a.to_session: raise ValueError('request needs --to and --to-session')

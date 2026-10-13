@@ -905,6 +905,20 @@ class CollaboratorBoards(unittest.TestCase):
         rows=json.loads(self.cli('boards','--json').stdout)
         self.assertEqual({r['name']:r['audience'] for r in rows},{'owner-board':'owner','proj':'collaborators'})
 
+    def test_project_name_of_an_underscored_checkout(self):
+        # a project id allows [a-z0-9-] only; a checkout whose real directory name has underscores
+        # (reached through a hyphenated symlink) is compared with underscores read as hyphens
+        real=self.ws/'my_paper'; real.mkdir()
+        subprocess.run(['git','init','-q','-b','main',str(real)],check=True)
+        (self.ws/'my-paper').symlink_to(real)
+        base=['request','--root',str(self.owner),'--agent','claude','--session','c-1','--thread','2026-10-13-underscore',
+              '--to','codex','--to-session','x-1','--summary','s','--acceptance','a','--source',str(self.ws/'my-paper'),
+              '--policy','ordinary','--preview']
+        p=self.cli(*base,'--project','my-paper')
+        self.assertIn('"key": "my-paper"',p.stdout)
+        bad=self.cli(*base,'--project','other-name',check=False)
+        self.assertNotEqual(bad.returncode,0); self.assertIn('basename',bad.stderr)
+
     def test_full_cycle_inside_a_project_repository(self):
         b=str(self.proj/'board')
         req=self.eid(self.cli('request','--root',b,'--agent','claude','--session','c-1','--thread','2026-10-05-check',
