@@ -31,13 +31,16 @@ Codex: inside its sandbox there is no network, so fetch and push fail there exac
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+try:
+    import fcntl                      # POSIX; Windows has no fcntl (board_items.py guards it the same way)
+except ImportError:                   # the fast-forward lock below is then skipped
+    fcntl = None
 from pathlib import Path
 
 import board_config as bc
@@ -292,8 +295,9 @@ class Repo:
         if self.sub or audience != 'owner': return False
         try:
             with open(self.common / 'board-ff.lock', 'w') as fh:
-                try: fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError: return False
+                if fcntl:
+                    try: fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError: return False
                 head = git(self.top, 'rev-parse', '--verify', '-q', 'HEAD', check=False).stdout.decode().strip()
                 branch = git(self.top, 'symbolic-ref', '--short', '-q', 'HEAD', check=False).stdout.decode().strip()
                 if not head or branch != self.branch: return False
