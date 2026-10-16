@@ -800,7 +800,8 @@ def main(argv=None) -> int:
     print(f"{a.out}  ({len(payload['threads'])} threads / {n} events{' / demo' if a.demo else ''}"
           f"{' / 🔒 locked' if payload.get('locked') else ''})")
     if a.open:
-        subprocess.run(["open", str(a.out)], check=False)
+        import webbrowser
+        webbrowser.open(Path(a.out).resolve().as_uri())        # macOS / Linux / Windows の既定ブラウザ (`open` は macOS だけ)
     return 0
 
 
